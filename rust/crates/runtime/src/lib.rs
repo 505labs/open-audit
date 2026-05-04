@@ -5,6 +5,7 @@
 //! that drives interactive and one-shot turns.
 
 pub mod audit;
+pub mod audit_panel;
 mod bash;
 pub mod bash_validation;
 mod bootstrap;
@@ -54,6 +55,10 @@ pub mod worker_boot;
 pub use audit::{
     EvidenceRef, Finding, FindingDraft, FindingSeverity, FindingStatus, HypothesisBoard,
     ReviewVerdict,
+};
+pub use audit_panel::{
+    print_status_panel, render_status_panel, standard_lanes, CurrentTool, LaneSnapshot,
+    LaneStatus, PanelInputs,
 };
 pub use bash::{execute_bash, BashCommandInput, BashCommandOutput};
 pub use bootstrap::{BootstrapPhase, BootstrapPlan};
