@@ -109,7 +109,7 @@ impl PermissionEnforcer {
         let mode = self.policy.active_mode();
 
         match mode {
-            PermissionMode::ReadOnly => EnforcementResult::Denied {
+            PermissionMode::AuditReadOnly | PermissionMode::ReadOnly => EnforcementResult::Denied {
                 tool: "write_file".to_owned(),
                 active_mode: mode.as_str().to_owned(),
                 required_mode: PermissionMode::WorkspaceWrite.as_str().to_owned(),
@@ -146,7 +146,7 @@ impl PermissionEnforcer {
         let mode = self.policy.active_mode();
 
         match mode {
-            PermissionMode::ReadOnly => {
+            PermissionMode::AuditReadOnly | PermissionMode::ReadOnly => {
                 if is_read_only_command(command) {
                     EnforcementResult::Allowed
                 } else {

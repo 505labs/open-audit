@@ -5,8 +5,17 @@ use serde_json::Value;
 use crate::config::RuntimePermissionRuleConfig;
 
 /// Permission level assigned to a tool invocation or runtime session.
+///
+/// Variants are listed from least to most permissive for the purpose of the
+/// derived `Ord`. `AuditReadOnly` is strictly below `ReadOnly`: it represents
+/// "read-only AND networkless" — sessions running at `AuditReadOnly` do not
+/// satisfy a tool whose `required_permission` is `ReadOnly` (notably
+/// `WebFetch` and `WebSearch`). The agent-level subtractive filter on
+/// [`tools::GlobalToolRegistry`] further hides workspace-mutating and
+/// network-touching tools from the visible tool list when audit mode is on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PermissionMode {
+    AuditReadOnly,
     ReadOnly,
     WorkspaceWrite,
     DangerFullAccess,
@@ -18,6 +27,7 @@ impl PermissionMode {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AuditReadOnly => "audit-read-only",
             Self::ReadOnly => "read-only",
             Self::WorkspaceWrite => "workspace-write",
             Self::DangerFullAccess => "danger-full-access",
@@ -492,6 +502,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn audit_read_only_label_round_trips_and_orders_below_read_only() {
+        let mode = PermissionMode::AuditReadOnly;
+        assert_eq!(mode.as_str(), "audit-read-only");
+        assert!(mode < PermissionMode::ReadOnly);
+        assert!(mode < PermissionMode::WorkspaceWrite);
+        assert!(mode < PermissionMode::DangerFullAccess);
+    }
+
+    #[test]
+    fn audit_read_only_session_meets_audit_read_only_requirement_only() {
+        // AuditReadOnly is strictly less permissive than ReadOnly:
+        // a session at AuditReadOnly satisfies tools whose required mode
+        // is also AuditReadOnly, and nothing higher. ReadOnly tools
+        // (including network-touching WebFetch/WebSearch which currently
+        // declare ReadOnly) are NOT met by an AuditReadOnly session.
+        let policy = PermissionPolicy::new(PermissionMode::AuditReadOnly)
+            .with_tool_requirement("audit_read", PermissionMode::AuditReadOnly)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite);
+
+        assert_eq!(
+            policy.authorize("audit_read", "{}", None),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            policy.authorize("read_file", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
+        assert!(matches!(
+            policy.authorize("write_file", "{}", None),
+            PermissionOutcome::Deny { .. }
+        ));
     }
 
     #[test]
