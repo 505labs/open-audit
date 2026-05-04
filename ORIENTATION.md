@@ -242,4 +242,50 @@ Two viable strategies:
 
 ## 6. Test harness
 
+**Test runners present:**
+
+- `cargo test --workspace` — Rust tests across all 9 crates. **This is the primary test surface.**
+- `scripts/fmt.sh --check` — `cargo fmt --check` over `rust/`. Shells out from repo root.
+- `cargo clippy --workspace --all-targets -- -D warnings` (per `rust/CLAUDE.md`) — lint gate.
+- `pytest tests/` — only one test file (`tests/test_porting_workspace.py`); Python pytest is **not** present in the system environment (`pytest` module unavailable under `/opt/homebrew/opt/python@3.14`). Currently a noop test surface — fine to ignore for OpenAudit MVP.
+
+**Baseline run results (recorded 2026-05-04 from `main` HEAD `568f17a` after Phase 0 docs commits):**
+
+- `scripts/fmt.sh --check` → exit 0 (green).
+- `cargo test --workspace` → **512 passed, 1 failed, 0 ignored** in the `runtime` crate's lib-tests; all other crates green.
+- `python3 -m pytest tests/` → cannot run; pytest not installed.
+
+**The single failure is pre-existing and unrelated to OpenAudit work** (no source code changes have been made; only documentation files added):
+
+```
+---- hooks::tests::malformed_nonempty_hook_output_reports_explicit_diagnostic_with_previews ----
+thread '...' panicked at crates/runtime/src/hooks.rs:1063:9:
+assertion failed: rendered.contains("second line stderr_preview=stderr warning")
+```
+
+The asserted string `"second line stderr_preview=stderr warning"` is split across two adjacent assertions (lines 1063 and 1064), where line 1064 is the same substring without the `"second line "` prefix. The test's intent is to verify a specific multi-line preview format that the hook diagnostic renderer no longer emits in the form the test expects. **Disposition:** record as a known-red on `main`; not in OpenAudit MVP scope to fix. Phase 1's "all tests still pass" acceptance is interpreted as "no new failures introduced" — a baseline-1 floor.
+
+**Per-crate green counts (from `cargo test --workspace`):**
+
+| Crate | Tests | Status |
+|---|---|---|
+| `api` (lib + 4 integration test bins) | 130 + 13 + 6 + 4 + 7 = 160 | green (1 ignored test in client_integration is intentional) |
+| `commands` | 42 | green |
+| `compat-harness` | 3 | green |
+| `mock-anthropic-service` (lib + bin) | 0 + 0 | green (no unit tests; covered via parity harness) |
+| `plugins` | 40 | green |
+| `runtime` (lib + integration_tests) | 512 + ? | **1 failure** (`hooks::tests::malformed_nonempty_hook_output...`); 512 others green |
+| `rusty-claude-cli` (5 integration test bins) | (mock_parity_harness, output_format_contract, etc.) | green |
+| `telemetry` | green |
+| `tools` | green |
+
+**Fixture-repo integration harness:** **None present for the audit use case.** What does exist:
+- `rust/crates/mock-anthropic-service` — a deterministic Anthropic-compatible mock server. **This is the right scaffold for Phase 1's provider tests** — extend it for OpenAI-compat / Moonshot fixtures rather than introducing `wiremock`/`mockito`.
+- `rust/crates/rusty-claude-cli/tests/mock_parity_harness.rs` — scripted scenarios that drive the CLI against the mock service. **This is the right scaffold for Phase 3's auditor+reviewer integration tests** — add new scenarios for "auditor finds SQLi → reviewer confirms" and "auditor drafts → reviewer refutes" flows.
+- `rust/mock_parity_scenarios.json` — declarative scenario catalog.
+
+**No fixture vulnerable repos exist yet.** Phase 5 must vendor (or pin) `damn-vulnerable-defi`, `juice-shop`, `OWASP/NodeGoat`, etc. under `fixtures/external/`.
+
+**Implication for Phase 1 acceptance:** "all tests still pass" reads as "the 512-passed/1-failed baseline holds; no new failures introduced." The pre-existing hooks test failure should be tracked as a separate cleanup task (out of OpenAudit MVP scope — file as upstream debt).
+
 ## 7. Risks and unknowns
