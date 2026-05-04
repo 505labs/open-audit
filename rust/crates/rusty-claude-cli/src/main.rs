@@ -618,12 +618,19 @@ fn run_audit_demo() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
-    // Bare invocation prints the splash banner and exits 0. No credentials
-    // probing, no API contact. TTY callers see the OPENAUDIT logo and a
-    // hint pointing at --help / --dry-run; piped callers see plain text.
+    // Bare invocation on a TTY: print the splash, then fall through to the
+    // inherited interactive REPL (the same agentic loop that Claude Code
+    // shipped — real API calls, real tools). Bare invocation on a pipe
+    // (no TTY) prints the splash and exits 0 so scripted callers don't
+    // hang on stdin.
     if args.is_empty() {
         print_openaudit_splash();
-        return Ok(());
+        if !io::stdin().is_terminal() {
+            return Ok(());
+        }
+        // Drop into the REPL by parsing an empty arg list, which the
+        // existing CLI dispatcher resolves to `CliAction` for interactive
+        // mode (model + permissions defaults from env / ~/.openaudit/config.toml).
     }
     if args.iter().any(|a| a == "--dry-run") {
         return print_openaudit_dry_run_table();
