@@ -178,9 +178,11 @@ pub fn resolve_model_alias(model: &str) -> String {
                     _ => trimmed,
                 },
                 ProviderKind::OpenAi => match *alias {
-                    "kimi" => "kimi-k2.5",
                     "kimi-2.6" => "kimi-2.6",
-                    "kimi-dashscope" => "kimi-k2.5",
+                    // Bare `kimi` retained as a back-compat alias for the
+                    // legacy DashScope-routed kimi-k2.5; `kimi-dashscope`
+                    // makes the same intent explicit for new configs.
+                    "kimi" | "kimi-dashscope" => "kimi-k2.5",
                     _ => trimmed,
                 },
             })
@@ -327,16 +329,11 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
         }),
-        // Kimi models via DashScope (Moonshot AI)
+        // Kimi models share an envelope across both DashScope-hosted (kimi-k1.5,
+        // kimi-k2.5) and direct-Moonshot (kimi-2.6) routes. Refine if Moonshot
+        // publishes route-specific limits.
         // Source: https://platform.moonshot.cn/docs/intro
-        "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
-            max_output_tokens: 16_384,
-            context_window_tokens: 256_000,
-        }),
-        // Kimi 2.x via direct Moonshot endpoint (api.moonshot.ai). Token
-        // limits start at the kimi-k2.5 envelope; refine if Moonshot publishes
-        // tighter or wider numbers.
-        "kimi-2.6" => Some(ModelTokenLimit {
+        "kimi-k2.5" | "kimi-k1.5" | "kimi-2.6" => Some(ModelTokenLimit {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),

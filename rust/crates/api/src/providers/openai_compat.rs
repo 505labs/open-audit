@@ -91,7 +91,7 @@ impl OpenAiCompatConfig {
     }
 
     /// Direct Moonshot AI endpoint (Kimi family models).
-    /// OpenAI-compatible REST shape at api.moonshot.ai/v1. Used by OpenAudit
+    /// OpenAI-compatible REST shape at `api.moonshot.ai/v1`. Used by `OpenAudit`
     /// as the default auditor backend.
     #[must_use]
     pub const fn moonshot() -> Self {
