@@ -32,13 +32,13 @@ Claw Code is the public Rust implementation of the `claw` CLI agent harness.
 The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
 
 > [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
+> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `openaudit doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 >
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
+> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `openaudit acp` (or `openaudit --acp`) for the current status instead of guessing from source layout; `openaudit acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
 
 ## Current repository shape
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
+- **`rust/`** — canonical Rust workspace and the `openaudit` CLI binary (with `claw` retained as a deprecated shim)
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
@@ -65,14 +65,14 @@ cargo build --workspace
 export ANTHROPIC_API_KEY="sk-ant-..."
 
 # 3. Verify everything is wired correctly
-./target/debug/claw doctor
+./target/debug/openaudit doctor
 
 # 4. Run a prompt
-./target/debug/claw prompt "say hello"
+./target/debug/openaudit prompt "say hello"
 ```
 
 > [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+> **Windows (PowerShell):** the binary is `openaudit.exe`, not `openaudit`. Use `.\target\debug\openaudit.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
 
 ### Windows setup
 
@@ -93,26 +93,26 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 4. **Run** (PowerShell — note `.exe` and backslash):
    ```powershell
    $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
+   .\target\debug\openaudit.exe prompt "say hello"
    ```
 
 **Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
 
 ## Post-build: locate the binary and verify
 
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
+After running `cargo build --workspace`, the `openaudit` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
 
 ### Binary location
 
 After `cargo build --workspace` in `claw-code/rust/`:
 
 **Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
+- **macOS/Linux:** `rust/target/debug/openaudit`
+- **Windows:** `rust/target/debug/openaudit.exe`
 
 **Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
+- **macOS/Linux:** `rust/target/release/openaudit`
+- **Windows:** `rust/target/release/openaudit.exe`
 
 If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
 
