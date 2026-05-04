@@ -333,8 +333,54 @@ fn merge_prompt_with_stdin(prompt: &str, stdin_content: Option<&str>) -> String 
     format!("{prompt}\n\n{trimmed}")
 }
 
+/// Resolve `~/.openaudit/config.toml` and print a `role | provider | model |
+/// base_url | auth_env` table to stdout, then exit. No network calls; useful
+/// for verifying that role -> provider wiring is correctly configured before
+/// invoking a real audit.
+fn print_openaudit_dry_run_table() -> Result<(), Box<dyn std::error::Error>> {
+    let config = match runtime::OpenAuditConfig::load_default() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!(
+                "warning: ~/.openaudit/config.toml could not be loaded ({err:?}); \
+                 showing role table with empty defaults."
+            );
+            runtime::OpenAuditConfig::default()
+        }
+    };
+
+    println!(
+        "{:<10} {:<12} {:<24} {:<40} {}",
+        "ROLE", "PROVIDER", "MODEL", "BASE_URL", "AUTH_ENV"
+    );
+    for role in ["auditor", "reviewer", "planner"] {
+        match config.resolve_role(role) {
+            Some((provider, entry)) => {
+                println!(
+                    "{:<10} {:<12} {:<24} {:<40} {}",
+                    role,
+                    provider,
+                    entry.model,
+                    entry.base_url.as_deref().unwrap_or("(provider default)"),
+                    entry.api_key_env.as_deref().unwrap_or("(provider default)"),
+                );
+            }
+            None => {
+                println!(
+                    "{:<10} {:<12} {:<24} {:<40} {}",
+                    role, "(unset)", "-", "-", "-"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--dry-run") {
+        return print_openaudit_dry_run_table();
+    }
     match parse_args(&args)? {
         CliAction::DumpManifests {
             output_format,

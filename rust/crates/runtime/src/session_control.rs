@@ -227,7 +227,7 @@ impl SessionStore {
     ///    its parent `.../sessions/` may hold pre-fingerprint files written
     ///    directly under `sessions/`.
     /// 2. The legacy `<workspace_root>/.claw/sessions/` tree from before the
-    ///    OpenAudit rebrand. New stores write to `.openaudit/sessions/<hash>/`
+    ///    `OpenAudit` rebrand. New stores write to `.openaudit/sessions/<hash>/`
     ///    (`from_cwd` performs a one-shot copy migration), but unpartitioned
     ///    legacy files at `.claw/sessions/<file>.jsonl` (no fingerprint subdir)
     ///    must continue to resolve.

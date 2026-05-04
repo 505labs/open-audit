@@ -264,6 +264,103 @@ fn command_in(cwd: &Path) -> Command {
     command
 }
 
+#[test]
+fn dry_run_resolves_roles_from_openaudit_home_config_and_exits_zero() {
+    // given — a tempdir acting as $OPENAUDIT_HOME with a config.toml that
+    // wires the auditor role to moonshot/kimi-2.6 and the reviewer role to
+    // anthropic/claude-opus-4-7.
+    let temp = unique_temp_dir("dry-run-resolve");
+    fs::create_dir_all(&temp).expect("temp dir should exist");
+    let config_path = temp.join("config.toml");
+    fs::write(
+        &config_path,
+        r#"
+[providers.moonshot]
+model = "kimi-2.6"
+api_key_env = "MOONSHOT_API_KEY"
+base_url = "https://api.moonshot.ai/v1"
+
+[providers.anthropic]
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[roles]
+auditor = "moonshot"
+reviewer = "anthropic"
+"#,
+    )
+    .expect("write fixture config.toml");
+
+    // when
+    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .current_dir(&temp)
+        .env("OPENAUDIT_HOME", &temp)
+        .arg("--dry-run")
+        .output()
+        .expect("openaudit should launch");
+
+    // then
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    assert!(stdout.contains("ROLE"), "header missing in:\n{stdout}");
+    assert!(stdout.contains("auditor"), "auditor row missing in:\n{stdout}");
+    assert!(stdout.contains("moonshot"), "moonshot provider missing in:\n{stdout}");
+    assert!(stdout.contains("kimi-2.6"), "kimi-2.6 model missing in:\n{stdout}");
+    assert!(
+        stdout.contains("https://api.moonshot.ai/v1"),
+        "moonshot base url missing in:\n{stdout}"
+    );
+    assert!(stdout.contains("reviewer"), "reviewer row missing in:\n{stdout}");
+    assert!(
+        stdout.contains("claude-opus-4-7"),
+        "reviewer model missing in:\n{stdout}"
+    );
+    // planner is intentionally absent from the fixture config; the dry-run
+    // table must still render the row, marked as unset.
+    assert!(stdout.contains("planner"), "planner row missing in:\n{stdout}");
+    assert!(
+        stdout.contains("(unset)"),
+        "expected unset marker for planner role in:\n{stdout}"
+    );
+
+    fs::remove_dir_all(&temp).expect("cleanup temp dir");
+}
+
+#[test]
+fn dry_run_with_missing_config_warns_but_still_exits_zero() {
+    // given — a tempdir set as $OPENAUDIT_HOME but with NO config.toml inside.
+    let temp = unique_temp_dir("dry-run-missing");
+    fs::create_dir_all(&temp).expect("temp dir should exist");
+
+    // when
+    let output = Command::new(env!("CARGO_BIN_EXE_claw"))
+        .current_dir(&temp)
+        .env("OPENAUDIT_HOME", &temp)
+        .arg("--dry-run")
+        .output()
+        .expect("openaudit should launch");
+
+    // then
+    assert_success(&output);
+    let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
+    let stderr = String::from_utf8(output.stderr).expect("stderr should be utf8");
+    assert!(stdout.contains("ROLE"));
+    assert!(
+        stderr.contains("config.toml")
+            || stderr.contains("could not be loaded")
+            || stderr.is_empty(),
+        "unexpected stderr:\n{stderr}"
+    );
+    // Every role row should be present, all marked unset since there is no
+    // config to read from.
+    assert!(stdout.contains("auditor"));
+    assert!(stdout.contains("reviewer"));
+    assert!(stdout.contains("planner"));
+    assert!(stdout.contains("(unset)"));
+
+    fs::remove_dir_all(&temp).expect("cleanup temp dir");
+}
+
 fn write_session(root: &Path, label: &str) -> PathBuf {
     let session_path = root.join(format!("{label}.jsonl"));
     let mut session = Session::new().with_workspace_root(root.to_path_buf());
