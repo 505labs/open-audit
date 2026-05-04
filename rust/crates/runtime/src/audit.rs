@@ -7,7 +7,12 @@
 //! persist them to `SQLite` blobs and the report renderers can read them back
 //! without re-defining the schema.
 
+use std::sync::{Arc, Mutex};
+
 use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use crate::conversation::{ApiClient, ConversationRuntime, RuntimeError, ToolError, ToolExecutor};
 
 /// Severity tier surfaced in reports and the status panel. Lowercase string
 /// when serialized; matches SARIF's level scheme loosely.
@@ -226,12 +231,303 @@ impl HypothesisBoard {
     }
 }
 
+// ----------------------------------------------------------------------------
+// Dual-agent driver
+// ----------------------------------------------------------------------------
+
+/// Name of the structured-output tool the auditor calls to register a finding.
+/// The dual-agent driver intercepts this name on the executor side; the tool
+/// itself is registered as a no-op return that confirms the draft was queued.
+pub const FINDING_DRAFT_TOOL_NAME: &str = "finding_draft";
+
+/// Errors the reviewer side can surface.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewerError {
+    /// Underlying provider failed (network, auth, parse).
+    Provider(String),
+    /// The reviewer's response could not be parsed into a `ReviewVerdict`.
+    UnparseableVerdict(String),
+}
+
+impl std::fmt::Display for ReviewerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Provider(msg) => write!(f, "reviewer provider error: {msg}"),
+            Self::UnparseableVerdict(msg) => write!(f, "reviewer returned unparseable verdict: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for ReviewerError {}
+
+/// Reviewer-side abstraction. A fresh implementation is constructed by
+/// [`ReviewerRuntimeFactory`] for **each** finding so the reviewer cannot see
+/// state from a prior finding's review.
+pub trait ReviewerSession {
+    /// Vote on a single finding draft. The reviewer may inspect cited
+    /// evidence (passed to it via the implementor's constructor) but cannot
+    /// call tools — its single output is the verdict.
+    ///
+    /// # Errors
+    /// Returns an error if the reviewer's underlying provider call fails or
+    /// the response cannot be parsed into a [`ReviewVerdict`].
+    fn vote(&mut self, draft: &FindingDraft) -> Result<ReviewVerdict, ReviewerError>;
+}
+
+/// Factory that produces a fresh [`ReviewerSession`] per finding. The driver
+/// invokes this once per intercepted `finding_draft`; the returned session is
+/// dropped after the verdict is captured.
+pub trait ReviewerRuntimeFactory {
+    /// Build a fresh reviewer session for the given finding. Implementations
+    /// typically construct a brand-new `ConversationRuntime` with an
+    /// audit-mode system prompt that wraps the finding draft and cited
+    /// evidence in `<untrusted>` tags.
+    fn build(&mut self, finding: &Finding) -> Box<dyn ReviewerSession>;
+}
+
+/// Shared queue between the wrapping tool executor and the dual-agent driver.
+/// The executor pushes parsed drafts whenever the auditor calls
+/// `finding_draft`; the driver drains the queue between turns.
+type DraftQueue = Arc<Mutex<Vec<FindingDraft>>>;
+
+/// `ToolExecutor` wrapper that intercepts `finding_draft` calls, parses the
+/// supplied input as a [`FindingDraft`], and stashes it for the driver.
+/// All other tool calls forward to the inner executor unchanged.
+pub struct DraftCapturingExecutor<T: ToolExecutor> {
+    inner: T,
+    queue: DraftQueue,
+}
+
+impl<T: ToolExecutor> DraftCapturingExecutor<T> {
+    fn new(inner: T, queue: DraftQueue) -> Self {
+        Self { inner, queue }
+    }
+}
+
+impl<T: ToolExecutor> ToolExecutor for DraftCapturingExecutor<T> {
+    fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError> {
+        if tool_name == FINDING_DRAFT_TOOL_NAME {
+            let draft: FindingDraft = serde_json::from_str(input)
+                .map_err(|err| ToolError::new(format!("finding_draft: invalid input: {err}")))?;
+            self.queue
+                .lock()
+                .map_err(|err| ToolError::new(format!("finding_draft: queue poisoned: {err}")))?
+                .push(draft);
+            return Ok(json!({"queued": true}).to_string());
+        }
+        self.inner.execute(tool_name, input)
+    }
+}
+
+/// Cap on how many `NeedsMoreEvidence` round-trips a single finding can
+/// trigger. Prevents pathological reviewer/auditor loops.
+const DEFAULT_MAX_REVISIONS_PER_FINDING: u32 = 1;
+
+/// Cap on how many auditor turns the driver will run in a single
+/// `run_to_completion`. Prevents runaway audits when the auditor keeps
+/// emitting drafts indefinitely.
+const DEFAULT_MAX_AUDITOR_TURNS: u32 = 32;
+
+/// Outcome of a completed dual-agent run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DualAgentRunOutcome {
+    pub board: HypothesisBoard,
+    pub auditor_turns: u32,
+}
+
+/// Dual-agent driver. Owns the auditor's `ConversationRuntime` and a factory
+/// that produces a fresh reviewer session per finding. See the Phase-3
+/// sub-plan for the state machine.
+pub struct DualAgentLoop<C, T, R>
+where
+    C: ApiClient,
+    T: ToolExecutor,
+    R: ReviewerRuntimeFactory,
+{
+    auditor: ConversationRuntime<C, DraftCapturingExecutor<T>>,
+    reviewer_factory: R,
+    board: HypothesisBoard,
+    queue: DraftQueue,
+    max_revisions_per_finding: u32,
+    max_auditor_turns: u32,
+}
+
+impl<C, T, R> DualAgentLoop<C, T, R>
+where
+    C: ApiClient,
+    T: ToolExecutor,
+    R: ReviewerRuntimeFactory,
+{
+    /// Build a driver. The caller hands in an already-configured auditor
+    /// runtime (with its own session, system prompt, permission policy)
+    /// minus the executor wrapper — this constructor wraps the supplied
+    /// executor so the driver can intercept `finding_draft` calls.
+    pub fn new(
+        session: crate::session::Session,
+        api_client: C,
+        tool_executor: T,
+        permission_policy: crate::permissions::PermissionPolicy,
+        system_prompt: Vec<String>,
+        reviewer_factory: R,
+    ) -> Self {
+        let queue: DraftQueue = Arc::new(Mutex::new(Vec::new()));
+        let wrapped = DraftCapturingExecutor::new(tool_executor, Arc::clone(&queue));
+        let auditor = ConversationRuntime::new(
+            session,
+            api_client,
+            wrapped,
+            permission_policy,
+            system_prompt,
+        );
+        Self {
+            auditor,
+            reviewer_factory,
+            board: HypothesisBoard::new(),
+            queue,
+            max_revisions_per_finding: DEFAULT_MAX_REVISIONS_PER_FINDING,
+            max_auditor_turns: DEFAULT_MAX_AUDITOR_TURNS,
+        }
+    }
+
+    #[must_use]
+    pub fn with_max_revisions_per_finding(mut self, cap: u32) -> Self {
+        self.max_revisions_per_finding = cap;
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_auditor_turns(mut self, cap: u32) -> Self {
+        self.max_auditor_turns = cap;
+        self
+    }
+
+    /// Snapshot of the current board. Cheap clone; primarily used by the
+    /// status-panel renderer between turns.
+    #[must_use]
+    pub fn board(&self) -> &HypothesisBoard {
+        &self.board
+    }
+
+    /// Drive the auditor + reviewer loop until either the auditor produces
+    /// no new drafts in a turn or `max_auditor_turns` is reached.
+    ///
+    /// # Errors
+    /// Surfaces the first auditor `RuntimeError` or reviewer error encountered.
+    /// The board contains all findings drafted up to the point of failure.
+    pub fn run_to_completion(
+        &mut self,
+        initial_prompt: impl Into<String>,
+    ) -> Result<DualAgentRunOutcome, DualAgentError> {
+        let mut next_prompt = initial_prompt.into();
+        let mut turns_run: u32 = 0;
+
+        loop {
+            if turns_run >= self.max_auditor_turns {
+                break;
+            }
+            let _summary = self
+                .auditor
+                .run_turn(next_prompt.clone(), None)
+                .map_err(DualAgentError::Auditor)?;
+            turns_run = turns_run.saturating_add(1);
+
+            let drained_drafts: Vec<FindingDraft> = {
+                let mut queue = self
+                    .queue
+                    .lock()
+                    .map_err(|err| DualAgentError::Internal(format!("queue poisoned: {err}")))?;
+                std::mem::take(&mut *queue)
+            };
+
+            if drained_drafts.is_empty() {
+                break;
+            }
+
+            // Two-phase: (1) push all drafts onto the board first so the
+            // reviewer factory can borrow the resulting Finding; (2) review
+            // each freshly-drafted finding with a fresh reviewer session.
+            let new_ids: Vec<String> = drained_drafts
+                .into_iter()
+                .map(|draft| self.board.push_drafted(draft))
+                .collect();
+
+            let mut needs_more_request: Option<String> = None;
+            for id in new_ids {
+                self.board.mark_reviewing(&id);
+                let finding = self
+                    .board
+                    .findings()
+                    .iter()
+                    .find(|f| f.id == id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DualAgentError::Internal(format!(
+                            "freshly drafted finding {id} vanished from board"
+                        ))
+                    })?;
+                let mut session = self.reviewer_factory.build(&finding);
+                let verdict = session
+                    .vote(&finding.draft)
+                    .map_err(DualAgentError::Reviewer)?;
+                self.board.apply_verdict(&id, verdict.clone());
+                if let ReviewVerdict::NeedsMoreEvidence { request } = verdict {
+                    let revisions = self.board.bump_revision(&id).unwrap_or(0);
+                    if revisions <= self.max_revisions_per_finding && needs_more_request.is_none() {
+                        needs_more_request = Some(request);
+                    }
+                }
+            }
+
+            match needs_more_request {
+                Some(req) => {
+                    next_prompt = req;
+                }
+                None => {
+                    break;
+                }
+            }
+        }
+
+        Ok(DualAgentRunOutcome {
+            board: self.board.clone(),
+            auditor_turns: turns_run,
+        })
+    }
+}
+
+/// Top-level error from [`DualAgentLoop::run_to_completion`].
+#[derive(Debug)]
+pub enum DualAgentError {
+    Auditor(RuntimeError),
+    Reviewer(ReviewerError),
+    Internal(String),
+}
+
+impl std::fmt::Display for DualAgentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Auditor(err) => write!(f, "auditor runtime error: {err}"),
+            Self::Reviewer(err) => write!(f, "reviewer error: {err}"),
+            Self::Internal(msg) => write!(f, "dual-agent driver internal error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for DualAgentError {}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        EvidenceRef, Finding, FindingDraft, FindingSeverity, FindingStatus, HypothesisBoard,
-        ReviewVerdict,
+        DualAgentError, DualAgentLoop, EvidenceRef, Finding, FindingDraft, FindingSeverity,
+        FindingStatus, HypothesisBoard, ReviewVerdict, ReviewerError, ReviewerRuntimeFactory,
+        ReviewerSession,
     };
+    use crate::conversation::{ApiClient, ApiRequest, AssistantEvent, RuntimeError, ToolExecutor};
+    use crate::permissions::PermissionPolicy;
+    use crate::session::Session;
+    use crate::usage::TokenUsage;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     fn sample_draft(title: &str) -> FindingDraft {
         FindingDraft {
@@ -374,5 +670,305 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), icons.len(), "icons must be distinct");
+    }
+
+    // ------------------------------------------------------------------
+    // DualAgentLoop tests — scripted auditor + reviewer stubs
+    // ------------------------------------------------------------------
+
+    /// Auditor stub: drives a finite script of `Vec<AssistantEvent>` per turn.
+    /// Each call to `stream` returns the next batch in `script`. Used to
+    /// simulate the auditor emitting `finding_draft` tool calls.
+    struct ScriptedAuditor {
+        script: Vec<Vec<AssistantEvent>>,
+        cursor: usize,
+    }
+
+    impl ApiClient for ScriptedAuditor {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let idx = self.cursor;
+            self.cursor += 1;
+            self.script
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| RuntimeError::new("scripted auditor exhausted"))
+        }
+    }
+
+    /// Trivial executor for non-`finding_draft` tool calls. The driver's
+    /// wrapping executor intercepts `finding_draft`; everything else (rare in
+    /// these tests) lands here.
+    struct NoopExecutor;
+
+    impl ToolExecutor for NoopExecutor {
+        fn execute(
+            &mut self,
+            _tool_name: &str,
+            _input: &str,
+        ) -> Result<String, super::ToolError> {
+            Ok("{}".to_string())
+        }
+    }
+
+    /// Reviewer stub: returns the next pre-scripted verdict per `vote` call.
+    struct ScriptedReviewer {
+        verdicts: Rc<RefCell<Vec<ReviewVerdict>>>,
+    }
+
+    impl ReviewerSession for ScriptedReviewer {
+        fn vote(&mut self, _draft: &FindingDraft) -> Result<ReviewVerdict, ReviewerError> {
+            self.verdicts
+                .borrow_mut()
+                .pop()
+                .ok_or_else(|| ReviewerError::Provider("no scripted verdicts left".to_string()))
+        }
+    }
+
+    struct ScriptedReviewerFactory {
+        verdicts: Rc<RefCell<Vec<ReviewVerdict>>>,
+        builds: Rc<RefCell<u32>>,
+    }
+
+    impl ReviewerRuntimeFactory for ScriptedReviewerFactory {
+        fn build(&mut self, _finding: &Finding) -> Box<dyn ReviewerSession> {
+            *self.builds.borrow_mut() += 1;
+            Box::new(ScriptedReviewer {
+                verdicts: Rc::clone(&self.verdicts),
+            })
+        }
+    }
+
+    fn finding_draft_tool_use(id: &str, draft: &FindingDraft) -> AssistantEvent {
+        AssistantEvent::ToolUse {
+            id: id.to_string(),
+            name: super::FINDING_DRAFT_TOOL_NAME.to_string(),
+            input: serde_json::to_string(draft).expect("serialize FindingDraft"),
+        }
+    }
+
+    fn build_driver(
+        script: Vec<Vec<AssistantEvent>>,
+        scripted_verdicts: Vec<ReviewVerdict>,
+    ) -> (
+        DualAgentLoop<ScriptedAuditor, NoopExecutor, ScriptedReviewerFactory>,
+        Rc<RefCell<u32>>,
+    ) {
+        // Scripted verdicts pop from the back, so reverse so callers can pass
+        // them in the order the driver will consume.
+        let mut verdicts = scripted_verdicts;
+        verdicts.reverse();
+        let verdicts = Rc::new(RefCell::new(verdicts));
+        let builds = Rc::new(RefCell::new(0_u32));
+
+        let session = Session::new();
+        let driver = DualAgentLoop::new(
+            session,
+            ScriptedAuditor { script, cursor: 0 },
+            NoopExecutor,
+            PermissionPolicy::new(crate::permissions::PermissionMode::DangerFullAccess),
+            vec!["test system prompt".to_string()],
+            ScriptedReviewerFactory {
+                verdicts,
+                builds: Rc::clone(&builds),
+            },
+        );
+        (driver, builds)
+    }
+
+    fn sqli_draft() -> FindingDraft {
+        FindingDraft {
+            title: "SQL injection in /search".to_string(),
+            severity: FindingSeverity::High,
+            cwe: Some("CWE-89".to_string()),
+            confidence: 0.9,
+            description: "Raw string concat in cursor.execute".to_string(),
+            evidence: vec![EvidenceRef {
+                kind: "file_slice".to_string(),
+                r#ref: "app.py:12-15".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn dual_agent_confirms_planted_finding_and_publishes_it() {
+        let draft = sqli_draft();
+        let script = vec![
+            vec![
+                finding_draft_tool_use("tu-1", &draft),
+                AssistantEvent::Usage(TokenUsage {
+                    input_tokens: 50,
+                    output_tokens: 20,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                }),
+                AssistantEvent::MessageStop,
+            ],
+            // Second turn: auditor produces no more drafts. Driver should
+            // detect empty queue and stop without further reviewer calls.
+            vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ],
+        ];
+
+        let (mut driver, builds) = build_driver(script, vec![ReviewVerdict::Confirm]);
+        let outcome = driver
+            .run_to_completion("audit this repo")
+            .expect("run completes");
+
+        assert_eq!(outcome.board.findings().len(), 1);
+        let finding = &outcome.board.findings()[0];
+        assert_eq!(finding.status, FindingStatus::Confirmed);
+        assert_eq!(finding.draft.cwe.as_deref(), Some("CWE-89"));
+        assert_eq!(outcome.board.published().count(), 1);
+        assert_eq!(outcome.board.refuted().count(), 0);
+        assert_eq!(*builds.borrow(), 1, "exactly one fresh reviewer built");
+    }
+
+    #[test]
+    fn dual_agent_refutes_false_positive_and_excludes_from_published() {
+        let draft = FindingDraft {
+            title: "Suspicious query".to_string(),
+            severity: FindingSeverity::Medium,
+            cwe: Some("CWE-89".to_string()),
+            confidence: 0.6,
+            description: "Looks like SQL but is parameterized".to_string(),
+            evidence: vec![EvidenceRef {
+                kind: "file_slice".to_string(),
+                r#ref: "app.py:12-15".to_string(),
+            }],
+        };
+        let script = vec![
+            vec![
+                AssistantEvent::TextDelta("looking".to_string()),
+                finding_draft_tool_use("tu-1", &draft),
+                AssistantEvent::MessageStop,
+            ],
+            vec![
+                AssistantEvent::TextDelta("done".to_string()),
+                AssistantEvent::MessageStop,
+            ],
+        ];
+
+        let refute = ReviewVerdict::Refute {
+            rationale: "uses cursor.execute(sql, params) parameterized binding".to_string(),
+        };
+        let (mut driver, _builds) = build_driver(script, vec![refute.clone()]);
+        let outcome = driver
+            .run_to_completion("audit this repo")
+            .expect("run completes");
+
+        assert_eq!(outcome.board.findings().len(), 1);
+        let finding = &outcome.board.findings()[0];
+        assert_eq!(finding.status, FindingStatus::Refuted);
+        match finding.review.as_ref() {
+            Some(ReviewVerdict::Refute { rationale }) => {
+                assert!(rationale.contains("parameterized"));
+            }
+            other => panic!("expected Refute verdict on the board, got {other:?}"),
+        }
+        assert_eq!(outcome.board.published().count(), 0);
+        assert_eq!(outcome.board.refuted().count(), 1);
+    }
+
+    #[test]
+    fn dual_agent_revisits_finding_when_reviewer_requests_more_evidence() {
+        // Turn 1: auditor drafts. Reviewer returns NeedsMoreEvidence.
+        // Turn 2: driver re-prompts auditor with the request; auditor
+        //         emits no new drafts (it answered the request inline).
+        // Stop.
+        //
+        // The board's only finding should be tagged NeedsMoreEvidence with
+        // revision_count == 1.
+        let draft = sqli_draft();
+        let script = vec![
+            // Turn 1, stream call 1: tool use.
+            vec![
+                AssistantEvent::TextDelta("looking".to_string()),
+                finding_draft_tool_use("tu-1", &draft),
+                AssistantEvent::MessageStop,
+            ],
+            // Turn 1, stream call 2: post-tool follow-up text (no further tools).
+            vec![
+                AssistantEvent::TextDelta("queued".to_string()),
+                AssistantEvent::MessageStop,
+            ],
+            // Turn 2 (after driver re-prompts with the NeedsMoreEvidence
+            // request): plain text, no new drafts.
+            vec![
+                AssistantEvent::TextDelta("answered".to_string()),
+                AssistantEvent::MessageStop,
+            ],
+        ];
+
+        let nme = ReviewVerdict::NeedsMoreEvidence {
+            request: "show the call site that builds the query string".to_string(),
+        };
+        let (mut driver, builds) = build_driver(script, vec![nme]);
+        let outcome = driver
+            .run_to_completion("audit this repo")
+            .expect("run completes");
+
+        assert_eq!(outcome.board.findings().len(), 1);
+        let finding = &outcome.board.findings()[0];
+        assert_eq!(finding.status, FindingStatus::NeedsMoreEvidence);
+        assert_eq!(
+            finding.revision_count, 1,
+            "driver must bump revision counter when forwarding the request"
+        );
+        assert_eq!(*builds.borrow(), 1);
+        assert_eq!(outcome.auditor_turns, 2, "two auditor turns expected");
+    }
+
+    #[test]
+    fn dual_agent_stops_on_empty_first_turn_without_calling_reviewer() {
+        // Auditor produces no drafts on the first turn. Driver should exit
+        // immediately and never construct a reviewer.
+        let script = vec![vec![
+            AssistantEvent::TextDelta("nothing to find".to_string()),
+            AssistantEvent::MessageStop,
+        ]];
+        let (mut driver, builds) = build_driver(script, vec![]);
+        let outcome = driver
+            .run_to_completion("audit this repo")
+            .expect("run completes");
+
+        assert_eq!(outcome.board.findings().len(), 0);
+        assert_eq!(*builds.borrow(), 0, "reviewer must not be built");
+        assert_eq!(outcome.auditor_turns, 1);
+    }
+
+    #[test]
+    fn dual_agent_surfaces_auditor_error_with_partial_board_intact() {
+        // Auditor errors on the first call. Driver should propagate the error
+        // and the board should be empty.
+        struct FailingAuditor;
+        impl ApiClient for FailingAuditor {
+            fn stream(&mut self, _r: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+                Err(RuntimeError::new("api timeout"))
+            }
+        }
+
+        let session = Session::new();
+        let mut driver = DualAgentLoop::new(
+            session,
+            FailingAuditor,
+            NoopExecutor,
+            PermissionPolicy::new(crate::permissions::PermissionMode::DangerFullAccess),
+            vec!["sys".to_string()],
+            ScriptedReviewerFactory {
+                verdicts: Rc::new(RefCell::new(vec![])),
+                builds: Rc::new(RefCell::new(0)),
+            },
+        );
+
+        let err = driver
+            .run_to_completion("go")
+            .expect_err("should surface auditor error");
+        match err {
+            DualAgentError::Auditor(_) => {}
+            other => panic!("expected Auditor error, got {other:?}"),
+        }
+        assert_eq!(driver.board().findings().len(), 0);
     }
 }
