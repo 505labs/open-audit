@@ -131,6 +131,30 @@ const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         },
     ),
+    // OpenAudit default auditor model. Routes through direct Moonshot AI
+    // endpoint (api.moonshot.ai) rather than the Alibaba DashScope-hosted Kimi
+    // proxy. Distinct auth env (MOONSHOT_API_KEY) so users can keep both
+    // configured simultaneously.
+    (
+        "kimi-2.6",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
+        },
+    ),
+    // Explicit alias for the legacy DashScope-hosted Kimi route, kept so
+    // tests and users that depend on the proxy path can spell it directly.
+    (
+        "kimi-dashscope",
+        ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "DASHSCOPE_API_KEY",
+            base_url_env: "DASHSCOPE_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
+        },
+    ),
 ];
 
 #[must_use]
@@ -155,6 +179,8 @@ pub fn resolve_model_alias(model: &str) -> String {
                 },
                 ProviderKind::OpenAi => match *alias {
                     "kimi" => "kimi-k2.5",
+                    "kimi-2.6" => "kimi-2.6",
+                    "kimi-dashscope" => "kimi-k2.5",
                     _ => trimmed,
                 },
             })
@@ -206,8 +232,20 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // Direct Moonshot AI endpoint for the kimi-2.x family (kimi-2.6 and
+    // future siblings). MUST come before the generic kimi-* fallback below
+    // so the Moonshot route wins over the legacy DashScope proxy.
+    if canonical.starts_with("kimi-2.") || canonical.starts_with("moonshot/") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_MOONSHOT_BASE_URL,
+        });
+    }
     // Kimi models (kimi-k2.5, kimi-k1.5, etc.) via DashScope compatible-mode.
-    // Routes kimi/* and kimi-* model names to DashScope endpoint.
+    // Routes kimi/* and kimi-* model names to DashScope endpoint. The
+    // kimi-2.x branch above takes priority for OpenAudit's preferred route.
     if canonical.starts_with("kimi/") || canonical.starts_with("kimi-") {
         return Some(ProviderMetadata {
             provider: ProviderKind::OpenAi,
@@ -292,6 +330,13 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         // Kimi models via DashScope (Moonshot AI)
         // Source: https://platform.moonshot.cn/docs/intro
         "kimi-k2.5" | "kimi-k1.5" => Some(ModelTokenLimit {
+            max_output_tokens: 16_384,
+            context_window_tokens: 256_000,
+        }),
+        // Kimi 2.x via direct Moonshot endpoint (api.moonshot.ai). Token
+        // limits start at the kimi-k2.5 envelope; refine if Moonshot publishes
+        // tighter or wider numbers.
+        "kimi-2.6" => Some(ModelTokenLimit {
             max_output_tokens: 16_384,
             context_window_tokens: 256_000,
         }),
@@ -470,8 +515,8 @@ mod tests {
     use super::{
         anthropic_missing_credentials, anthropic_missing_credentials_hint, detect_provider_kind,
         load_dotenv_file, max_tokens_for_model, max_tokens_for_model_with_override,
-        model_token_limit, parse_dotenv, preflight_message_request, resolve_model_alias,
-        ProviderKind,
+        metadata_for_model, model_token_limit, parse_dotenv, preflight_message_request,
+        resolve_model_alias, ProviderKind,
     };
 
     /// Serializes every test in this module that mutates process-wide
@@ -1143,4 +1188,46 @@ NO_EQUALS_LINE
     // (env_lock only protects within a single binary). The detection logic
     // is covered: OPENAI_BASE_URL alone routes to OpenAi as a last-resort
     // fallback in detect_provider_kind().
+
+    #[test]
+    fn metadata_for_kimi_2_6_routes_to_moonshot_direct() {
+        let meta = metadata_for_model("kimi-2.6").expect("kimi-2.6 should resolve");
+        assert_eq!(meta.provider, ProviderKind::OpenAi);
+        assert_eq!(meta.auth_env, "MOONSHOT_API_KEY");
+        assert_eq!(meta.base_url_env, "MOONSHOT_BASE_URL");
+        assert_eq!(meta.default_base_url, "https://api.moonshot.ai/v1");
+    }
+
+    #[test]
+    fn metadata_for_legacy_kimi_still_routes_to_dashscope() {
+        // Backward-compat: existing kimi-k1.5 / kimi-k2.5 routes must keep
+        // pointing at the DashScope proxy so users with DASHSCOPE_API_KEY
+        // configured do not silently fail when the spec adds Moonshot direct.
+        let meta = metadata_for_model("kimi-k2.5").expect("kimi-k2.5 should resolve");
+        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
+        assert!(meta.default_base_url.contains("dashscope"));
+    }
+
+    #[test]
+    fn metadata_for_explicit_kimi_dashscope_alias_routes_to_dashscope() {
+        let meta =
+            metadata_for_model("kimi-dashscope").expect("kimi-dashscope alias should resolve");
+        assert_eq!(meta.auth_env, "DASHSCOPE_API_KEY");
+        assert!(meta.default_base_url.contains("dashscope"));
+    }
+
+    #[test]
+    fn moonshot_namespaced_model_routes_to_moonshot() {
+        let meta =
+            metadata_for_model("moonshot/kimi-2.6").expect("moonshot/* prefix should resolve");
+        assert_eq!(meta.auth_env, "MOONSHOT_API_KEY");
+        assert!(meta.default_base_url.contains("moonshot.ai"));
+    }
+
+    #[test]
+    fn kimi_2_6_token_limit_is_registered() {
+        let limit = model_token_limit("kimi-2.6").expect("kimi-2.6 token limit should be set");
+        assert!(limit.context_window_tokens >= 128_000);
+        assert!(limit.max_output_tokens >= 8_192);
+    }
 }
