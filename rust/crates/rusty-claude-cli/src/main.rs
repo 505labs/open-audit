@@ -162,6 +162,22 @@ const DEFAULT_DATE: &str = match option_env!("BUILD_DATE") {
 };
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// OPENAUDIT splash logo. ANSI Shadow font, 6 rows × 73 cols. Fits on a
+/// standard 80-column terminal; narrower terminals will wrap, which is
+/// acceptable for a banner. Rendered with ANSI color when stdout is a TTY,
+/// plain text when piped (see [`render_splash`]).
+const OPENAUDIT_ASCII_LOGO: &str = "\
+ ██████╗ ██████╗ ███████╗███╗   ██╗ █████╗ ██╗   ██╗██████╗ ██╗████████╗
+██╔═══██╗██╔══██╗██╔════╝████╗  ██║██╔══██╗██║   ██║██╔══██╗██║╚══██╔══╝
+██║   ██║██████╔╝█████╗  ██╔██╗ ██║███████║██║   ██║██║  ██║██║   ██║
+██║   ██║██╔═══╝ ██╔══╝  ██║╚██╗██║██╔══██║██║   ██║██║  ██║██║   ██║
+╚██████╔╝██║     ███████╗██║ ╚████║██║  ██║╚██████╔╝██████╔╝██║   ██║
+ ╚═════╝ ╚═╝     ╚══════╝╚═╝  ╚═══╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝   ╚═╝   ";
+
+const OPENAUDIT_SPLASH_TAGLINE: &str =
+    "model-agnostic, terminal-native, dual-agent security auditor";
+
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -376,8 +392,46 @@ fn print_openaudit_dry_run_table() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Render the OPENAUDIT splash banner — ASCII logo, tagline, version, and a
+/// one-line hint pointing at `--help`. ANSI-colored when `colorize` is true;
+/// plain text otherwise (so piped invocations stay readable).
+fn render_splash(colorize: bool) -> String {
+    if colorize {
+        format!(
+            "\x1b[38;5;51m{logo}\x1b[0m\n\
+             \x1b[2m{tagline}\x1b[0m\n\
+             \x1b[2mv{version}\x1b[0m  \x1b[2m·\x1b[0m  Run \x1b[1mopenaudit --help\x1b[0m for usage  \x1b[2m·\x1b[0m  \x1b[1mopenaudit --dry-run\x1b[0m to verify provider wiring\n",
+            logo = OPENAUDIT_ASCII_LOGO,
+            tagline = OPENAUDIT_SPLASH_TAGLINE,
+            version = VERSION,
+        )
+    } else {
+        format!(
+            "{logo}\n{tagline}\nv{version}  ·  Run `openaudit --help` for usage  ·  `openaudit --dry-run` to verify provider wiring\n",
+            logo = OPENAUDIT_ASCII_LOGO,
+            tagline = OPENAUDIT_SPLASH_TAGLINE,
+            version = VERSION,
+        )
+    }
+}
+
+/// Print the splash banner to stdout. Used by bare `openaudit` invocation
+/// (no args, no subcommand) so the user sees the brand and a brief help
+/// pointer instead of a credentials error.
+fn print_openaudit_splash() {
+    let colorize = io::stdout().is_terminal();
+    print!("{}", render_splash(colorize));
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
+    // Bare invocation prints the splash banner and exits 0. No credentials
+    // probing, no API contact. TTY callers see the OPENAUDIT logo and a
+    // hint pointing at --help / --dry-run; piped callers see plain text.
+    if args.is_empty() {
+        print_openaudit_splash();
+        return Ok(());
+    }
     if args.iter().any(|a| a == "--dry-run") {
         return print_openaudit_dry_run_table();
     }
@@ -9192,49 +9246,49 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
 
 #[allow(clippy::too_many_lines)]
 fn print_help_to(out: &mut impl Write) -> io::Result<()> {
-    writeln!(out, "claw v{VERSION}")?;
+    writeln!(out, "openaudit v{VERSION}")?;
     writeln!(out)?;
     writeln!(out, "Usage:")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+        "  openaudit [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
     )?;
     writeln!(out, "      Start the interactive REPL")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] prompt TEXT"
+        "  openaudit [--model MODEL] [--output-format text|json] prompt TEXT"
     )?;
     writeln!(out, "      Send one prompt and exit")?;
     writeln!(
         out,
-        "  claw [--model MODEL] [--output-format text|json] TEXT"
+        "  openaudit [--model MODEL] [--output-format text|json] TEXT"
     )?;
     writeln!(out, "      Shorthand non-interactive prompt mode")?;
     writeln!(
         out,
-        "  claw --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
+        "  openaudit --resume [SESSION.jsonl|session-id|latest] [/status] [/compact] [...]"
     )?;
     writeln!(
         out,
         "      Inspect or maintain a saved session without entering the REPL"
     )?;
-    writeln!(out, "  claw help")?;
+    writeln!(out, "  openaudit help")?;
     writeln!(out, "      Alias for --help")?;
-    writeln!(out, "  claw version")?;
+    writeln!(out, "  openaudit version")?;
     writeln!(out, "      Alias for --version")?;
-    writeln!(out, "  claw status")?;
+    writeln!(out, "  openaudit status")?;
     writeln!(
         out,
         "      Show the current local workspace status snapshot"
     )?;
-    writeln!(out, "  claw sandbox")?;
+    writeln!(out, "  openaudit sandbox")?;
     writeln!(out, "      Show the current sandbox isolation snapshot")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  openaudit doctor")?;
     writeln!(
         out,
         "      Diagnose local auth, config, workspace, and sandbox health"
     )?;
-    writeln!(out, "  claw acp [serve]")?;
+    writeln!(out, "  openaudit acp [serve]")?;
     writeln!(
         out,
         "      Show ACP/Zed editor integration status (currently unsupported; aliases: --acp, -acp)"
@@ -9244,16 +9298,16 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         out,
         "      Warning: do not `{DEPRECATED_INSTALL_COMMAND}` (deprecated stub)"
     )?;
-    writeln!(out, "  claw dump-manifests [--manifests-dir PATH]")?;
-    writeln!(out, "  claw bootstrap-plan")?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp")?;
-    writeln!(out, "  claw skills")?;
-    writeln!(out, "  claw system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
-    writeln!(out, "  claw init")?;
+    writeln!(out, "  openaudit dump-manifests [--manifests-dir PATH]")?;
+    writeln!(out, "  openaudit bootstrap-plan")?;
+    writeln!(out, "  openaudit agents")?;
+    writeln!(out, "  openaudit mcp")?;
+    writeln!(out, "  openaudit skills")?;
+    writeln!(out, "  openaudit system-prompt [--cwd PATH] [--date YYYY-MM-DD]")?;
+    writeln!(out, "  openaudit init")?;
     writeln!(
         out,
-        "  claw export [PATH] [--session SESSION] [--output PATH]"
+        "  openaudit export [PATH] [--session SESSION] [--output PATH]"
     )?;
     writeln!(
         out,
@@ -9315,33 +9369,33 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
         "  Use /session list in the REPL to browse managed sessions"
     )?;
     writeln!(out, "Examples:")?;
-    writeln!(out, "  claw --model claude-opus \"summarize this repo\"")?;
+    writeln!(out, "  openaudit --model claude-opus \"summarize this repo\"")?;
     writeln!(
         out,
-        "  claw --output-format json prompt \"explain src/main.rs\""
+        "  openaudit --output-format json prompt \"explain src/main.rs\""
     )?;
-    writeln!(out, "  claw --compact \"summarize Cargo.toml\" | wc -l")?;
+    writeln!(out, "  openaudit --compact \"summarize Cargo.toml\" | wc -l")?;
     writeln!(
         out,
-        "  claw --allowedTools read,glob \"summarize Cargo.toml\""
+        "  openaudit --allowedTools read,glob \"summarize Cargo.toml\""
     )?;
-    writeln!(out, "  claw --resume {LATEST_SESSION_REFERENCE}")?;
+    writeln!(out, "  openaudit --resume {LATEST_SESSION_REFERENCE}")?;
     writeln!(
         out,
-        "  claw --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
+        "  openaudit --resume {LATEST_SESSION_REFERENCE} /status /diff /export notes.txt"
     )?;
-    writeln!(out, "  claw agents")?;
-    writeln!(out, "  claw mcp show my-server")?;
-    writeln!(out, "  claw /skills")?;
-    writeln!(out, "  claw doctor")?;
+    writeln!(out, "  openaudit agents")?;
+    writeln!(out, "  openaudit mcp show my-server")?;
+    writeln!(out, "  openaudit /skills")?;
+    writeln!(out, "  openaudit doctor")?;
     writeln!(out, "  source of truth: {OFFICIAL_REPO_URL}")?;
     writeln!(
         out,
         "  do not run `{DEPRECATED_INSTALL_COMMAND}` — it installs a deprecated stub"
     )?;
-    writeln!(out, "  claw init")?;
-    writeln!(out, "  claw export")?;
-    writeln!(out, "  claw export conversation.md")?;
+    writeln!(out, "  openaudit init")?;
+    writeln!(out, "  openaudit export")?;
+    writeln!(out, "  openaudit export conversation.md")?;
     Ok(())
 }
 
@@ -11908,20 +11962,22 @@ mod tests {
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw help"));
-        assert!(help.contains("claw version"));
-        assert!(help.contains("claw status"));
-        assert!(help.contains("claw sandbox"));
-        assert!(help.contains("claw init"));
-        assert!(help.contains("claw acp [serve]"));
-        assert!(help.contains("claw agents"));
-        assert!(help.contains("claw mcp"));
-        assert!(help.contains("claw skills"));
-        assert!(help.contains("claw /skills"));
+        assert!(help.contains("openaudit help"));
+        assert!(help.contains("openaudit version"));
+        assert!(help.contains("openaudit status"));
+        assert!(help.contains("openaudit sandbox"));
+        assert!(help.contains("openaudit init"));
+        assert!(help.contains("openaudit acp [serve]"));
+        assert!(help.contains("openaudit agents"));
+        assert!(help.contains("openaudit mcp"));
+        assert!(help.contains("openaudit skills"));
+        assert!(help.contains("openaudit /skills"));
+        // Project history references — these reference the upstream repo,
+        // not the renamed binary, so they stay as-is.
         assert!(help.contains("ultraworkers/claw-code"));
         assert!(help.contains("cargo install claw-code"));
-        assert!(!help.contains("claw login"));
-        assert!(!help.contains("claw logout"));
+        assert!(!help.contains("openaudit login"));
+        assert!(!help.contains("openaudit logout"));
     }
 
     #[test]
@@ -12463,10 +12519,10 @@ UU conflicted.rs",
         let mut help = Vec::new();
         print_help_to(&mut help).expect("help should render");
         let help = String::from_utf8(help).expect("help should be utf8");
-        assert!(help.contains("claw --resume [SESSION.jsonl|session-id|latest]"));
+        assert!(help.contains("openaudit --resume [SESSION.jsonl|session-id|latest]"));
         assert!(help.contains("Use `latest` with --resume, /resume, or /session switch"));
-        assert!(help.contains("claw --resume latest"));
-        assert!(help.contains("claw --resume latest /status /diff /export notes.txt"));
+        assert!(help.contains("openaudit --resume latest"));
+        assert!(help.contains("openaudit --resume latest /status /diff /export notes.txt"));
     }
 
     #[test]
