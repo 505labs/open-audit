@@ -72,6 +72,58 @@ claw <args>
 
 ## 2. Tool registry
 
+**Source of truth:** `rust/crates/tools/src/lib.rs` — 9,708 LOC. Tool specs are returned by the function `mvp_tool_specs()` at `rust/crates/tools/src/lib.rs:392`. Each spec is a `ToolSpec { name, description, input_schema (serde_json::Value), required_permission: PermissionMode }`. The dispatcher is `pub fn execute_tool(name, input)` at `rust/crates/tools/src/lib.rs:1196`. The `GlobalToolRegistry` (line 109) holds runtime tools, plugin tools, and the permission enforcer.
+
+**Permission classification scheme** (already implemented):
+- `PermissionMode::ReadOnly` — safe-by-default tool, no workspace mutation, no shell.
+- `PermissionMode::WorkspaceWrite` — writes inside the workspace boundary.
+- `PermissionMode::DangerFullAccess` — bash, sub-agent spawning, network, anything not bounded.
+
+This is exactly the classification axis OpenAudit needs. **For audit mode, only `ReadOnly` tools should be visible to the auditor by default.** `WorkspaceWrite` tools are repurposed for `note_append` / `finding_draft` / `finding_finalize` (audit-internal writes). `DangerFullAccess` tools are dropped or replaced with `sandbox_exec` behind the two-key rule.
+
+### Built-in tool inventory (from `mvp_tool_specs()` in `rust/crates/tools/src/lib.rs`)
+
+| # | Tool | Line | Permission | Audit disposition |
+|---|---|---|---|---|
+| 1 | `bash` | 395 | DangerFullAccess | **drop** in audit mode; replace with `sandbox_exec` (Phase 2) |
+| 2 | `read_file` | 416 | ReadOnly | keep |
+| 3 | `write_file` | 431 | WorkspaceWrite | drop (or restrict to `.openaudit/` evidence dir) |
+| 4 | `edit_file` | 445 | WorkspaceWrite | drop |
+| 5 | `glob_search` | 461 | ReadOnly | keep |
+| 6 | `grep_search` | 475 | ReadOnly | keep |
+| 7 | `WebFetch` | 501 | ReadOnly | network-gated under `--allow-network` |
+| 8 | `WebSearch` | 516 | ReadOnly | network-gated under `--allow-network` |
+| 9 | `TodoWrite` | 537 | WorkspaceWrite | repurpose as audit-internal note tool |
+| 10 | `Skill` | 565 | ReadOnly | keep (playbook checklist surfaces) |
+| 11 | `Agent` | 579 | DangerFullAccess | drop in audit mode (auditor doesn't spawn sub-agents directly; reviewer is wired by the runtime, not via tool) |
+| 12 | `ToolSearch` | 596 | ReadOnly | keep |
+| 13 | `NotebookEdit` | 610 | WorkspaceWrite | drop |
+| 14 | `Sleep` | 627 | ReadOnly | keep (rate-limit handling) |
+| 15 | `SendUserMessage` | 640 | varies | drop (no Discord routing in audit mode) |
+| 16 | `Config` | 661 | varies | drop (audit run is config-frozen) |
+| 17 | `EnterPlanMode` / `ExitPlanMode` | 677 / 687 | ReadOnly | keep |
+| 18 | `StructuredOutput` | 697 | ReadOnly | keep — basis for `finding_draft` |
+| 19 | `REPL` | 706 | DangerFullAccess | drop |
+| 20 | `PowerShell` | 721 | DangerFullAccess | drop |
+| 21 | `AskUserQuestion` | 737 | ReadOnly | keep (interactive review prompts) |
+| 22 | `TaskCreate` / `TaskGet` / `TaskList` / `TaskStop` / `TaskUpdate` / `TaskOutput` | 754 / 800 / 813 / 823 / 836 / 850 | varies | repurpose for hypothesis-board state |
+| 23 | `RunTaskPacket` | 768 | DangerFullAccess | drop |
+| 24 | `WorkerCreate` … `WorkerObserveCompletion` | 863 … 989 | DangerFullAccess | drop in audit MVP; revisit if planner spawns workers |
+| 25 | `TeamCreate` / `TeamDelete` | 1004 / 1028 | DangerFullAccess | drop |
+| 26 | `CronCreate` / `CronDelete` / `CronList` | 1041 / 1056 / 1069 | DangerFullAccess | drop |
+| 27 | `LSP` | 1079 | ReadOnly | keep — cheap structural lookups |
+| 28 | `ListMcpResources` / `ReadMcpResource` / `McpAuth` / `MCP` | 1096 / 1108 / 1122 / 1151 | varies | keep `ReadMcpResource` (read-only); MCP shape is how playbook-supplied tools will register |
+| 29 | `RemoteTrigger` | 1135 | DangerFullAccess | drop |
+| 30 | `TestingPermission` | 1166 | varies | drop — internal test fixture |
+
+**Tools to add in Phase 2** (none of these exist yet — see plan §Phase 2): `ast_grep`, `tree_sitter_query`, `semgrep_run`, `slither_run`, `osv_scan`, `sandbox_exec`, `note_append`, `finding_draft`, `finding_finalize`.
+
+**File operations** (called from tool wrappers): `runtime/src/file_ops.rs:744` already provides `read_file`, `write_file`, `edit_file`, `glob_search`, `grep_search` with `MAX_READ_SIZE`, `MAX_WRITE_SIZE`, NUL-byte binary detection, and workspace-boundary validation. **Reuse these directly** — they meet OpenAudit's safety bar already.
+
+**Bash sandbox** (relevant to `sandbox_exec`): `runtime/src/sandbox.rs` — Linux `unshare`-based isolation, capability-probed at startup. Container detection in `detect_container_environment`. **Use this for `sandbox_exec`'s implementation; do not write a new sandbox path.**
+
+**MCP tool surface** (relevant to playbook-supplied tools): `runtime/src/mcp_tool_bridge.rs`, `runtime/src/mcp_stdio.rs`, `runtime/src/mcp_lifecycle_hardened.rs`. Playbooks can ship their own static-analysis tool wrappers as MCP servers; the existing MCP plumbing handles discovery, lifecycle, and execution.
+
 ## 3. Model provider abstraction
 
 ## 4. Conversation / turn state
