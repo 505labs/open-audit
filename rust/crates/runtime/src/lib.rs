@@ -26,6 +26,7 @@ pub mod mcp_server;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
 mod oauth;
+pub mod openaudit_config;
 pub mod permission_enforcer;
 mod permissions;
 pub mod plugin_lifecycle;
@@ -117,6 +118,11 @@ pub use oauth::{
     parse_oauth_callback_request_target, save_oauth_credentials, OAuthAuthorizationRequest,
     OAuthCallbackParams, OAuthRefreshRequest, OAuthTokenExchangeRequest, OAuthTokenSet,
     PkceChallengeMethod, PkceCodePair,
+};
+pub use openaudit_config::{
+    default_config_path as openaudit_config_path, ConfigError as OpenAuditConfigError,
+    OpenAuditConfig, ProviderEntry as OpenAuditProviderEntry,
+    RoleAssignments as OpenAuditRoleAssignments,
 };
 pub use permissions::{
     PermissionContext, PermissionMode, PermissionOutcome, PermissionOverride, PermissionPolicy,
