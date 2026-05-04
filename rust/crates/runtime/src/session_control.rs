@@ -28,7 +28,11 @@ pub struct SessionStore {
 impl SessionStore {
     /// Build a store from the server's current working directory.
     ///
-    /// The on-disk layout becomes `<cwd>/.claw/sessions/<workspace_hash>/`.
+    /// The on-disk layout becomes `<cwd>/.openaudit/sessions/<workspace_hash>/`.
+    /// If a legacy `<cwd>/.claw/sessions/<workspace_hash>/` directory exists
+    /// from a previous (pre-rebrand) install and the new `.openaudit/` path
+    /// does not, the legacy contents are copied across once. The legacy
+    /// directory is left in place so a downgrade still works.
     pub fn from_cwd(cwd: impl AsRef<Path>) -> Result<Self, SessionControlError> {
         let cwd = cwd.as_ref();
         // #151: canonicalize so equivalent paths (symlinks, relative vs
@@ -36,10 +40,21 @@ impl SessionStore {
         // workspace_fingerprint. Falls back to the raw path if canonicalize
         // fails (e.g. the directory doesn't exist yet).
         let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        let fingerprint = workspace_fingerprint(&canonical_cwd);
         let sessions_root = canonical_cwd
+            .join(".openaudit")
+            .join("sessions")
+            .join(&fingerprint);
+        let legacy_root = canonical_cwd
             .join(".claw")
             .join("sessions")
-            .join(workspace_fingerprint(&canonical_cwd));
+            .join(&fingerprint);
+        if !sessions_root.exists() && legacy_root.exists() {
+            // One-shot copy from legacy `.claw/` layout. Best effort: if the
+            // copy fails part way through, fall back to creating an empty
+            // store so the user still gets a working session dir.
+            let _ = copy_dir_recursive(&legacy_root, &sessions_root);
+        }
         fs::create_dir_all(&sessions_root)?;
         Ok(Self {
             sessions_root,
@@ -131,7 +146,7 @@ impl SessionStore {
                 return Ok(path);
             }
         }
-        if let Some(legacy_root) = self.legacy_sessions_root() {
+        for legacy_root in self.legacy_sessions_roots() {
             for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
                 let path = legacy_root.join(format!("{session_id}.{extension}"));
                 if !path.exists() {
@@ -150,7 +165,7 @@ impl SessionStore {
     pub fn list_sessions(&self) -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
         let mut sessions = Vec::new();
         self.collect_sessions_from_dir(&self.sessions_root, &mut sessions)?;
-        if let Some(legacy_root) = self.legacy_sessions_root() {
+        for legacy_root in self.legacy_sessions_roots() {
             self.collect_sessions_from_dir(&legacy_root, &mut sessions)?;
         }
         sort_managed_sessions(&mut sessions);
@@ -203,11 +218,33 @@ impl SessionStore {
         })
     }
 
-    fn legacy_sessions_root(&self) -> Option<PathBuf> {
-        self.sessions_root
+    /// Candidate directories that may contain sessions written by older
+    /// (pre-fingerprint or pre-rebrand) layouts. Probed in order; the first
+    /// match wins.
+    ///
+    /// Two sources today:
+    /// 1. The store's own parent — if `sessions_root` is `.../sessions/<hash>/`,
+    ///    its parent `.../sessions/` may hold pre-fingerprint files written
+    ///    directly under `sessions/`.
+    /// 2. The legacy `<workspace_root>/.claw/sessions/` tree from before the
+    ///    OpenAudit rebrand. New stores write to `.openaudit/sessions/<hash>/`
+    ///    (`from_cwd` performs a one-shot copy migration), but unpartitioned
+    ///    legacy files at `.claw/sessions/<file>.jsonl` (no fingerprint subdir)
+    ///    must continue to resolve.
+    fn legacy_sessions_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::new();
+        if let Some(parent) = self
+            .sessions_root
             .parent()
             .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-            .map(Path::to_path_buf)
+        {
+            roots.push(parent.to_path_buf());
+        }
+        let claw_root = self.workspace_root.join(".claw").join("sessions");
+        if claw_root.is_dir() && !roots.iter().any(|existing| existing == &claw_root) {
+            roots.push(claw_root);
+        }
+        roots
     }
 
     fn validate_loaded_session(
@@ -309,6 +346,25 @@ pub fn workspace_fingerprint(workspace_root: &Path) -> String {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     format!("{hash:016x}")
+}
+
+/// Copy a directory tree recursively. Used by [`SessionStore::from_cwd`] to
+/// migrate a legacy `.claw/sessions/<hash>/` directory into the new
+/// `.openaudit/sessions/<hash>/` location on first use after the rebrand.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let dest_path = dest.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_dir_recursive(&entry.path(), &dest_path)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), &dest_path)?;
+        }
+        // Symlinks and other unusual entries are skipped on purpose.
+    }
+    Ok(())
 }
 
 pub const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
@@ -1023,5 +1079,115 @@ mod tests {
             "forked session path must be inside the store namespace"
         );
         fs::remove_dir_all(base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn from_cwd_writes_to_openaudit_directory_not_legacy_claw() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("temp dir created");
+        // Match the store's canonicalized view of the workspace root so
+        // path comparisons work on macOS where /tmp -> /private/tmp.
+        let base = fs::canonicalize(&base).unwrap_or(base);
+
+        let store = SessionStore::from_cwd(&base).expect("store builds");
+
+        let new_dir = base.join(".openaudit").join("sessions");
+        let legacy_dir = base.join(".claw").join("sessions");
+        assert!(
+            store.sessions_dir().starts_with(&new_dir),
+            "sessions_dir should live under .openaudit/sessions, got {}",
+            store.sessions_dir().display()
+        );
+        assert!(new_dir.exists(), ".openaudit/sessions must be created");
+        assert!(
+            !legacy_dir.exists(),
+            "fresh workspace must not auto-create the legacy .claw dir"
+        );
+
+        fs::remove_dir_all(&base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn from_cwd_migrates_legacy_claw_session_dir_when_openaudit_missing() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("temp dir created");
+        let base = fs::canonicalize(&base).unwrap_or(base);
+
+        // Seed the legacy directory layout.
+        let canonical = base.clone();
+        let fingerprint = workspace_fingerprint(&canonical);
+        let legacy_namespace = canonical
+            .join(".claw")
+            .join("sessions")
+            .join(&fingerprint);
+        fs::create_dir_all(&legacy_namespace).expect("seed legacy namespace");
+        let legacy_session = legacy_namespace.join("sess-abc.jsonl");
+        fs::write(&legacy_session, b"legacy-bytes\n").expect("seed legacy session");
+
+        let store = SessionStore::from_cwd(&base).expect("store builds");
+
+        let migrated_session = canonical
+            .join(".openaudit")
+            .join("sessions")
+            .join(&fingerprint)
+            .join("sess-abc.jsonl");
+        assert!(
+            migrated_session.exists(),
+            "migrated session file should exist at {}",
+            migrated_session.display()
+        );
+        let migrated_bytes = fs::read(&migrated_session).expect("read migrated bytes");
+        assert_eq!(
+            migrated_bytes, b"legacy-bytes\n",
+            "migration must preserve original session bytes"
+        );
+        assert!(
+            legacy_session.exists(),
+            "legacy session file must remain in place after copy migration"
+        );
+        assert!(
+            store.sessions_dir().starts_with(canonical.join(".openaudit")),
+            "store should resolve into the new .openaudit namespace"
+        );
+
+        fs::remove_dir_all(&base).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn from_cwd_does_not_double_migrate_when_openaudit_already_present() {
+        let base = temp_dir();
+        fs::create_dir_all(&base).expect("temp dir created");
+        let base = fs::canonicalize(&base).unwrap_or(base);
+
+        let canonical = base.clone();
+        let fingerprint = workspace_fingerprint(&canonical);
+        let legacy_namespace = canonical
+            .join(".claw")
+            .join("sessions")
+            .join(&fingerprint);
+        let new_namespace = canonical
+            .join(".openaudit")
+            .join("sessions")
+            .join(&fingerprint);
+        fs::create_dir_all(&legacy_namespace).expect("seed legacy");
+        fs::create_dir_all(&new_namespace).expect("seed new");
+        // Legacy file that should NOT be copied because the new dir already exists.
+        fs::write(legacy_namespace.join("legacy-only.jsonl"), b"old\n")
+            .expect("seed legacy file");
+        // Marker in the new dir that should remain untouched.
+        fs::write(new_namespace.join("native.jsonl"), b"new\n").expect("seed new file");
+
+        let _store = SessionStore::from_cwd(&base).expect("store builds");
+
+        assert!(
+            !new_namespace.join("legacy-only.jsonl").exists(),
+            "legacy file must NOT have been copied because .openaudit already existed"
+        );
+        assert!(
+            new_namespace.join("native.jsonl").exists(),
+            "pre-existing files in .openaudit must be left alone"
+        );
+
+        fs::remove_dir_all(&base).expect("temp dir should clean up");
     }
 }
