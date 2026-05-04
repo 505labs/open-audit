@@ -170,6 +170,40 @@ The user's stated MVP target is **direct Moonshot API at `https://api.moonshot.a
 
 ## 4. Conversation / turn state
 
+**On-disk layout (current):** `<cwd>/.claw/sessions/<workspace_fingerprint>/<session-id>.jsonl`. Source: `runtime/src/session_control.rs:31-40` — `SessionStore::from_cwd` joins `.claw` to the cwd. `workspace_fingerprint` (`session_control.rs:304`) is a hash of the workspace root so multiple repos sharing one home directory don't collide.
+
+Alternate path: `SessionStore::from_data_dir(...)` at `session_control.rs:54-76` lays out `<data_dir>/sessions/<workspace_hash>/` for "managed" sessions used by remote/server modes.
+
+**Persistence format:** JSONL — one record per line. Sessions are written incrementally; `Session::push_message` appends a single line, and `Session::save_to_path` (`session.rs:204`) writes a full snapshot. Format renderers: `to_jsonl_record` on `ConversationMessage`, `SessionPromptEntry`, `SessionCompaction`. Atomic-ish via `render_jsonl_snapshot` (`session.rs:521`) for full rewrites and direct append for streaming writes.
+
+**Records per turn:**
+- `MessageRole::User` / `MessageRole::Assistant` / `MessageRole::ToolResult` (defined `session.rs:20`).
+- Each message has `Vec<ContentBlock>` (`session.rs:29`) — text, tool_use, tool_result blocks; mirrors Anthropic message shape.
+- Token usage attached to assistant messages (`assistant_with_usage`, `session.rs:644`).
+- `SessionCompaction` records when auto-compaction collapses prior turns.
+- `SessionPromptEntry` records prompt-cache fingerprint history.
+
+**Cost / usage tracking:** `runtime/src/usage.rs` exports `UsageTracker`, `TokenUsage`, `ModelPricing`, `format_usd`, `pricing_for_model`. Already aggregates per-call cost; pricing tables baked in. **Reuse for the TUI's live $ counter (Phase 7) directly.**
+
+**Telemetry / tracing:** `telemetry` crate exports `SessionTracer`, `JsonlTelemetrySink`, `MemoryTelemetrySink`. Used by `ConversationRuntime` (see `conversation.rs:5`). Provides per-turn structured events — relevant to Phase 4 evidence store.
+
+**Verdict for Phase 4 (evidence store):**
+
+The existing JSONL session store is **not** sufficient for the spec's Phase-4 evidence store, but is a **useful foundation**. Differences:
+
+| | Existing JSONL session | Phase-4 evidence store (spec) |
+|---|---|---|
+| Format | JSONL | SQLite + content-addressed blobs |
+| Granularity | Conversation turns | Every turn + every tool call (input + output blobs) |
+| Schema | Anthropic message shape | Tables: `runs`, `turns`, `tool_calls`, `findings`, `evidence`, `reviews` |
+| Bundle | None — directory copy | `<run_id>.tar.zst` |
+| Replay | "resume" — re-enters a chat | "replay" — reconstructs the report from stored events without re-calling models |
+| Determinism | not asserted | byte-stable Markdown report across machines |
+
+**Recommendation:** keep the JSONL session as-is for short-term parity tests. Add the Phase-4 evidence store as a **new** module under `rust/crates/runtime/src/evidence/` (or a new `evidence` crate) that wraps `ApiClient` and `ToolExecutor` to record every event into SQLite + blobs in parallel. The existing `SessionTracer` plumbing is the right hook point — it already sees every turn.
+
+**Implication for Phase 1:** binary rename touches `.claw/` → `.openaudit/`. Two paths to update in `runtime/src/session_control.rs:40` and any string `".claw"` literal across the workspace. A migration shim that reads the old `.claw/` path one last time and copies to `.openaudit/` is sufficient — JSONL format is stable across the rename.
+
 ## 5. System prompt assembly
 
 ## 6. Test harness
