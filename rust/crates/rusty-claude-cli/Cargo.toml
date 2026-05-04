@@ -6,8 +6,16 @@ license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "claw"
+name = "openaudit"
 path = "src/main.rs"
+
+# Backward-compat alias retained for one release after the OpenAudit rebrand.
+# A tiny shim that prints a stderr deprecation warning (TTY only) and
+# delegates to the sibling `openaudit` binary via process::Command. Lets
+# integration tests bound on env!("CARGO_BIN_EXE_claw") keep compiling.
+[[bin]]
+name = "claw"
+path = "src/bin/claw_legacy_shim.rs"
 
 [dependencies]
 api = { path = "../api" }
