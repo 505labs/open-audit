@@ -1,210 +1,191 @@
-# Claw Code
+# OpenAudit
 
-<p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
-  ·
-  <a href="./USAGE.md">Usage</a>
-  ·
-  <a href="./rust/README.md">Rust workspace</a>
-  ·
-  <a href="./PARITY.md">Parity</a>
-  ·
-  <a href="./ROADMAP.md">Roadmap</a>
-  ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
-</p>
+> A model-agnostic, terminal-native, dual-agent security auditor.
 
-<p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
-    </picture>
-  </a>
-</p>
+OpenAudit is a CLI that runs versioned audit playbooks against a codebase using two cooperating LLM agents. One agent investigates and drafts findings; a second, isolated agent reviews each finding in a fresh context and votes to confirm, refute, or request more evidence. Every model turn and every tool call is recorded into a reproducible evidence bundle that a teammate can replay on a different machine.
 
-<p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
-</p>
+We'd rather miss a finding than ship a wrong one.
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+## Why a separate tool?
 
-> [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `openaudit doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
->
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon entrypoint yet. Run `openaudit acp` (or `openaudit --acp`) for the current status instead of guessing from source layout; `openaudit acp serve` is currently a discoverability alias only, and real ACP support remains tracked separately in `ROADMAP.md`.
+General-purpose coding agents are tuned for exploration and patching. Auditing wants the opposite posture: read-only by default, structured outputs, no shortcuts to "fix it for me," explicit reviewer dissent, and a paper trail that holds up after the chat session ends. OpenAudit is read-only by default, emits structured outputs, runs a second agent on a different vendor for an independent vote, and persists every turn and tool call as evidence.
 
-## Current repository shape
+## Headline features
 
-- **`rust/`** — canonical Rust workspace and the `openaudit` CLI binary (with `claw` retained as a deprecated shim)
-- **`USAGE.md`** — task-oriented usage guide for the current product surface
-- **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
-- **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+### Dual-agent loop with independent reviewer
 
-## Quick start
+- **Auditor** explores the codebase, runs static-analysis tools, and drafts findings.
+- **Reviewer** instantiates fresh per finding, sees only the draft + cited evidence, cannot call tools, and must vote: `confirm` / `refute` (with rationale) / `needs_more_evidence` (with a specific request).
+- By default the reviewer runs on a **different vendor** than the auditor. The MVP wiring is auditor = Moonshot `kimi-2.6`, reviewer = Anthropic `claude-opus-4-7`. This is a structural defense against single-model failure modes.
+- An optional **planner** pass (`--plan`) generates prioritized hypotheses up front from the playbook checklist.
 
-> [!NOTE]
-> [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
-> ```bash
-> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
-> ```
-> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
+### Model-agnostic providers
+
+A single provider layer abstracts the model API. Implementations:
+
+| Provider | Notes |
+|---|---|
+| Anthropic | Claude Opus / Sonnet / Haiku. |
+| Moonshot AI | `kimi-2.6` (default auditor for MVP). OpenAI-compatible API at `https://api.moonshot.ai/v1`. |
+| OpenAI | GPT-4o / o-series. |
+| Google | Gemini. |
+| OpenAI-compatible | Local vLLM, Ollama, LM Studio, or any compatible endpoint. |
+
+You assign providers to roles in `~/.openaudit/config.toml` under a `[roles]` block (auditor / reviewer / planner). Override per-invocation with `--provider <name>` or `--role-provider auditor=local`.
+
+### Audit-specific tools
+
+The agent gets only the tools that make sense for read-only static review. Editing, git mutation, and unsandboxed shell exec are **disabled** in audit mode.
+
+| Tool | Wraps | Purpose |
+|---|---|---|
+| `view`, `list`, `glob`, `ripgrep` | built-in | file inspection |
+| `ast_grep` | `ast-grep` CLI | structural pattern search across languages |
+| `tree_sitter_query` | tree-sitter | language-aware AST queries |
+| `semgrep_run` | `semgrep --json` | rule-pack static analysis |
+| `slither_run` | `slither --json -` | Solidity static analysis |
+| `osv_scan` | `osv-scanner` | vulnerable dependency detection (network-gated) |
+| `sandbox_exec` | docker / `unshare` with `--network none` | gated dynamic checks (off by default) |
+| `finding_draft`, `finding_finalize` | structured outputs | the audit's own bookkeeping |
+
+### Versioned playbooks
+
+A playbook is a directory: a system prompt for the auditor, one for the reviewer, a checklist for the planner, optional invariants, and few-shot known-pattern examples. Resolution order is local path → `~/.openaudit/playbooks/<id>@<version>` → registry pull.
+
+Starter packs ship in-tree:
+
+- **`generic`** — language-agnostic security review.
+- **`solidity-defi`** — AMM, lending, oracle manipulation, admin keys, reentrancy, MEV-tail.
+- **`tee-attestation`** — attestation chain, sealing-key handling, enclave boundary review.
+- **`python-web`** — auth, SQL injection, deserialization, SSRF, template injection.
+
+Pin a playbook by `id@version` so a finding from six months ago can be re-run against the same rules.
+
+### Reproducible evidence bundles
+
+Every model turn and every tool call writes a row in a per-run SQLite database plus a content-addressed blob. The whole thing tars to `<run_id>.tar.zst`.
+
+- `openaudit replay <bundle>` — reconstructs the report **without re-calling models**, from stored events. Fast, deterministic, auditable.
+- `openaudit replay --rerun <bundle>` — re-calls models with the same inputs to verify determinism or A/B providers.
+
+A finding's report links back to the exact turn IDs that produced it, so reviewers can answer "where did this conclusion come from?" by reading transcript slices.
+
+### Reports for humans and machines
+
+- **Markdown** (default, byte-stable across replays) — the human-readable artifact.
+- **JSON** — for downstream tooling.
+- **SARIF 2.1.0** — for GitHub code-scanning, Azure DevOps, and any SARIF-aware platform.
+- **HTML** — shareable static report.
+
+A stub `openaudit/action@v1` GitHub Action runs on PRs and posts findings as review comments.
+
+## Live TUI
+
+A hypothesis board shows, in real time, every line of investigation: status (`investigating | drafted | reviewed | confirmed | refuted`), the current tool call, live token + dollar counters per provider, and per-role provider banners so you always know who is speaking. Keybinds:
+
+- `p` — pause / resume
+- `k` — kill the current hypothesis
+- `f` — focus a hypothesis (allocate more budget)
+- `?` — open the finding under cursor
+
+Run with `--no-tui` to stream JSON events to stdout, one per line, for piping into other tools.
+
+## Guardrails (non-negotiable)
+
+These aren't optional features. They are merge gates.
+
+1. **Prompt injection defense.** Every byte of repo content (file bodies, READMEs, blame messages, comments) is wrapped in `<untrusted>...</untrusted>` before being shown to any agent. The system prompt explicitly states that text inside `<untrusted>` is data, not commands. A planted-vuln + injection-attempt fixture regression-tests this.
+2. **Sandbox two-key rule.** `sandbox_exec` is registered into the agent's tool list **only** when the playbook declares `sandbox_exec = true` AND the user passes `--allow-exec`. Both, or it's not there.
+3. **Network deny-by-default.** Tools that touch the network (e.g. `osv_scan`, registry pull) declare it in metadata and are dropped unless `--allow-network` is set.
+4. **Secret redaction.** AWS keys, GitHub tokens, JWT-shaped strings, RSA/EC private key headers, generic high-entropy hex blocks — all redacted **before** evidence is persisted and **before** content reaches any model. Reports show `[REDACTED:aws_key]`, with a redaction map keyed on sha256 (never the raw secret).
+5. **No telemetry by default.** No phone-home. If we ever add telemetry it will be opt-in, documented, and never include code content.
+
+## Quickstart
 
 ```bash
-# 1. Clone and build
+# 1. Build from source
 git clone https://github.com/ultraworkers/claw-code
 cd claw-code/rust
 cargo build --workspace
 
-# 2. Set your API key (Anthropic API key — not a Claude subscription)
-export ANTHROPIC_API_KEY="sk-ant-..."
+# 2. Configure providers
+mkdir -p ~/.openaudit
+cat > ~/.openaudit/config.toml <<'TOML'
+[providers.moonshot]
+model = "kimi-2.6"
+api_key_env = "MOONSHOT_API_KEY"
+base_url = "https://api.moonshot.ai/v1"
 
-# 3. Verify everything is wired correctly
-./target/debug/openaudit doctor
+[providers.anthropic]
+model = "claude-opus-4-7"
+api_key_env = "ANTHROPIC_API_KEY"
 
-# 4. Run a prompt
-./target/debug/openaudit prompt "say hello"
+[roles]
+auditor  = "moonshot"
+reviewer = "anthropic"
+TOML
+
+export MOONSHOT_API_KEY=...
+export ANTHROPIC_API_KEY=...
+
+# 3. Verify role -> provider -> model resolution without making network calls
+./target/debug/openaudit --dry-run run ./fixtures/empty --playbook generic
+
+# 4. Audit a Solidity codebase
+./target/debug/openaudit run ./fixtures/vuln-amm --playbook solidity-defi
+
+# 5. Emit SARIF for CI
+./target/debug/openaudit run ./repo --playbook generic --output sarif > findings.sarif
+
+# 6. Bundle round-trip via replay
+tar -cf - .openaudit/runs/<id> | zstd > audit.tar.zst
+./target/debug/openaudit replay audit.tar.zst
 ```
 
-> [!NOTE]
-> **Windows (PowerShell):** the binary is `openaudit.exe`, not `openaudit`. Use `.\target\debug\openaudit.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+See [`USAGE.md`](./USAGE.md) for the full task-oriented guide.
 
-### Windows setup
+## Status
 
-**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
+Pre-MVP. Honest snapshot:
 
-1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
-2. **Verify Rust is on PATH:**
-   ```powershell
-   cargo --version
-   ```
-   If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
-3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
-   ```powershell
-   git clone https://github.com/ultraworkers/claw-code
-   cd claw-code/rust
-   cargo build --workspace
-   ```
-4. **Run** (PowerShell — note `.exe` and backslash):
-   ```powershell
-   $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\openaudit.exe prompt "say hello"
-   ```
+- **Phase 0 — Orientation.** Committed. See [`ORIENTATION.md`](./ORIENTATION.md).
+- **Phase 1 — Rebrand + provider abstraction + Moonshot routing.** Committed. The binary is `openaudit`; `kimi-2.6` resolves through the Moonshot direct config; `~/.openaudit/config.toml` and `[roles]` are wired.
+- **Phase 2 — Audit-specific tools** (`ast_grep`, `tree_sitter_query`, `semgrep_run`, `slither_run`, `osv_scan`, `sandbox_exec`, `finding_draft`, `finding_finalize`). In progress.
+- **Phase 3 — Dual-agent loop** (auditor + reviewer + planner state machine). Pending.
+- **Phase 4 — Evidence store** (SQLite + content-addressed blobs + bundle round-trip). Pending.
+- **Phase 5 — Playbooks** (`generic`, `solidity-defi`, `tee-attestation`, `python-web`). Pending.
+- **Phase 6 — Reports + CI** (Markdown / JSON / SARIF 2.1.0 / HTML + GitHub Action). Pending.
+- **Phase 7 — Live TUI**. Pending.
 
-**Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
+The full plan lives at [`docs/superpowers/plans/2026-05-04-openaudit-mvp.md`](./docs/superpowers/plans/2026-05-04-openaudit-mvp.md).
 
-## Post-build: locate the binary and verify
+## Build
 
-After running `cargo build --workspace`, the `openaudit` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
-
-### Binary location
-
-After `cargo build --workspace` in `claw-code/rust/`:
-
-**Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/openaudit`
-- **Windows:** `rust/target/debug/openaudit.exe`
-
-**Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/openaudit`
-- **Windows:** `rust/target/release/openaudit.exe`
-
-If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
-
-### Verify the build succeeded
-
-Test the binary directly using its path:
+From the repo root, format check:
 
 ```bash
-# macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
-
-# Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+scripts/fmt.sh --check    # use scripts/fmt.sh (no flag) to apply formatting
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
-
-### Optional: Add to PATH
-
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
-
-**Option 1: Symlink (macOS/Linux)**
-```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
-```
-Then reload your shell and test:
-```bash
-claw --help
-```
-
-**Option 2: Use `cargo install` (all platforms)**
-
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
-```bash
-# From the claw-code/rust/ directory
-cargo install --path . --force
-
-# Then from anywhere
-claw --help
-```
-
-**Option 3: Update shell profile (bash/zsh)**
-
-Add this line to `~/.bashrc` or `~/.zshrc`:
-```bash
-export PATH="$(pwd)/rust/target/debug:$PATH"
-```
-
-Reload your shell:
-```bash
-source ~/.bashrc  # or source ~/.zshrc
-claw --help
-```
-
-### Troubleshooting
-
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
-
-> [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
-
-Run the workspace test suite after verifying the binary works:
+From `rust/`, lint and test:
 
 ```bash
-cd rust
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-## Documentation map
+The binary is `openaudit`. The legacy `claw` name is retained as a deprecation shim for one release and emits a stderr warning when invoked. For the full task-oriented build / auth / session / harness guide, see [`USAGE.md`](./USAGE.md).
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
-- [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
-- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
+## Threat model — in scope vs out of scope
 
-## Ecosystem
+**In scope:** static and structural code review. Pattern-based detection. AST-aware queries. Dependency vulnerability lookup. Reasoning over evidence the auditor pulls from the codebase. Optional gated dynamic checks inside a network-isolated sandbox.
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+**Out of scope:** active exploitation, dynamic fuzzing of running services, network-level attack tooling, supply-chain compromise, detection evasion. OpenAudit is a code auditor; exploitation tools are out of scope and won't be wired in — they would change the project's threat model and legal posture. For dynamic testing, run a separate authorized-target tool. OpenAudit reads code; it does not attack systems.
 
-- [clawhip](https://github.com/Yeachan-Heo/clawhip)
-- [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
-- [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+## Heritage
 
-## Ownership / affiliation disclaimer
+OpenAudit forks the [`claw-code`](https://github.com/ultraworkers/claw-code) Rust harness — a Claude Code reimplementation by ultraworkers/claw-code. The auditor's tool plumbing, agent loop, terminal renderer, session store, and config system are inherited from that base; OpenAudit adds the dual-agent loop, audit-specific tool surface, playbooks, evidence store, and provider abstraction on top. The project's coordination methodology lives on in [`PHILOSOPHY.md`](./PHILOSOPHY.md); binary parity status against the upstream harness lives in [`PARITY.md`](./PARITY.md).
 
-- This repository does **not** claim ownership of the original Claude Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+## License
+
+Apache-2.0 (target).
