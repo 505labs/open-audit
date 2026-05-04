@@ -423,6 +423,199 @@ fn print_openaudit_splash() {
     print!("{}", render_splash(colorize));
 }
 
+/// Phase-3 demo: drive a dual-agent loop end-to-end with scripted auditor
+/// and reviewer in process, rendering the status panel between turns. Useful
+/// for showing off the dual-agent state machine without configuring a real
+/// provider; the same code path will be wired up to live providers in Phase 5
+/// once playbook resolution lands.
+fn run_audit_demo() -> Result<(), Box<dyn std::error::Error>> {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use runtime::audit::{
+        DualAgentLoop, EvidenceRef, Finding, FindingDraft, FindingSeverity, ReviewVerdict,
+        ReviewerError, ReviewerRuntimeFactory, ReviewerSession, FINDING_DRAFT_TOOL_NAME,
+    };
+    use runtime::audit_panel::{
+        render_status_panel, standard_lanes, CurrentTool, LaneStatus, PanelInputs,
+    };
+    use runtime::{
+        ApiClient, ApiRequest, AssistantEvent, PermissionMode, PermissionPolicy, RuntimeError,
+        Session, ToolError, ToolExecutor, TokenUsage,
+    };
+
+    // ----- scripted auditor -----
+    struct ScriptedAuditor {
+        script: Vec<Vec<AssistantEvent>>,
+        cursor: usize,
+    }
+    impl ApiClient for ScriptedAuditor {
+        fn stream(&mut self, _request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let idx = self.cursor;
+            self.cursor += 1;
+            self.script
+                .get(idx)
+                .cloned()
+                .ok_or_else(|| RuntimeError::new("scripted auditor exhausted"))
+        }
+    }
+
+    // ----- noop tool executor (driver wraps to intercept finding_draft) -----
+    struct NoopExecutor;
+    impl ToolExecutor for NoopExecutor {
+        fn execute(&mut self, _name: &str, _input: &str) -> Result<String, ToolError> {
+            Ok("{}".to_string())
+        }
+    }
+
+    // ----- scripted reviewer that always confirms -----
+    struct AlwaysConfirm;
+    impl ReviewerSession for AlwaysConfirm {
+        fn vote(&mut self, _draft: &FindingDraft) -> Result<ReviewVerdict, ReviewerError> {
+            Ok(ReviewVerdict::Confirm)
+        }
+    }
+    struct ConfirmFactory {
+        builds: Rc<RefCell<u32>>,
+    }
+    impl ReviewerRuntimeFactory for ConfirmFactory {
+        fn build(&mut self, _finding: &Finding) -> Box<dyn ReviewerSession> {
+            *self.builds.borrow_mut() += 1;
+            Box::new(AlwaysConfirm)
+        }
+    }
+
+    let demo_draft = FindingDraft {
+        title: "SQL injection in /search query".to_string(),
+        severity: FindingSeverity::High,
+        cwe: Some("CWE-89".to_string()),
+        confidence: 0.92,
+        description: "User-controlled `q` parameter is concatenated into a raw SQL string; \
+                      no parameterization."
+            .to_string(),
+        evidence: vec![EvidenceRef {
+            kind: "file_slice".to_string(),
+            r#ref: "fixtures/vuln-sql-injection/app.py:14-18".to_string(),
+        }],
+    };
+
+    let script = vec![
+        // Turn 1, stream call 1: auditor narrates and emits a finding_draft
+        // tool call carrying the draft as JSON input.
+        vec![
+            AssistantEvent::TextDelta(
+                "Inspecting the search route — looks like raw string concat.".to_string(),
+            ),
+            AssistantEvent::ToolUse {
+                id: "tu-1".to_string(),
+                name: FINDING_DRAFT_TOOL_NAME.to_string(),
+                input: serde_json::to_string(&demo_draft)?,
+            },
+            AssistantEvent::Usage(TokenUsage {
+                input_tokens: 12_847,
+                output_tokens: 2_103,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 8_200,
+            }),
+            AssistantEvent::MessageStop,
+        ],
+        // Turn 1, stream call 2: post-tool follow-up text.
+        vec![
+            AssistantEvent::TextDelta("Draft queued. Continuing.".to_string()),
+            AssistantEvent::MessageStop,
+        ],
+        // Turn 2: nothing more to find.
+        vec![
+            AssistantEvent::TextDelta("No further hypotheses.".to_string()),
+            AssistantEvent::MessageStop,
+        ],
+    ];
+
+    let builds = Rc::new(RefCell::new(0_u32));
+    let mut driver = DualAgentLoop::new(
+        Session::new(),
+        ScriptedAuditor { script, cursor: 0 },
+        NoopExecutor,
+        PermissionPolicy::new(PermissionMode::DangerFullAccess),
+        vec!["You are the OpenAudit auditor agent.".to_string()],
+        ConfirmFactory {
+            builds: Rc::clone(&builds),
+        },
+    );
+
+    let colorize = io::stdout().is_terminal();
+    println!();
+    print!("{}", render_splash(colorize));
+    println!();
+
+    // Initial pre-run snapshot so the user sees the panel even on the very
+    // first frame.
+    {
+        let usage = TokenUsage::default();
+        let lanes = standard_lanes(
+            "moonshot/kimi-2.6 (scripted)",
+            "anthropic/claude-opus-4-7 (scripted)",
+            "moonshot/kimi-2.6 (idle)",
+            LaneStatus::Busy("investigating".to_string()),
+            LaneStatus::Idle,
+            LaneStatus::Idle,
+        );
+        let inputs = PanelInputs {
+            lanes: &lanes,
+            current_tool: Some(&CurrentTool {
+                name: "grep_search".to_string(),
+                summary: r#"pattern="\$_(GET|POST)" path=fixtures/"#.to_string(),
+            }),
+            usage: &usage,
+            usage_cost_usd: 0.0,
+            board: driver.board(),
+        };
+        print!("{}", render_status_panel(&inputs, colorize));
+    }
+
+    // Drive the dual-agent loop to completion. The scripted auditor + reviewer
+    // produce one Confirmed finding. In a real Phase-5 wiring the panel would
+    // be re-rendered after each turn; here we render again post-run to show
+    // the final state.
+    let outcome = driver.run_to_completion("Audit fixtures/vuln-sql-injection/")?;
+
+    println!();
+    let lanes = standard_lanes(
+        "moonshot/kimi-2.6 (scripted)",
+        "anthropic/claude-opus-4-7 (scripted)",
+        "moonshot/kimi-2.6 (idle)",
+        LaneStatus::Done,
+        LaneStatus::Done,
+        LaneStatus::Idle,
+    );
+    let final_usage = TokenUsage {
+        input_tokens: 13_412,
+        output_tokens: 2_481,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 8_200,
+    };
+    let inputs = PanelInputs {
+        lanes: &lanes,
+        current_tool: None,
+        usage: &final_usage,
+        usage_cost_usd: 0.0237,
+        board: &outcome.board,
+    };
+    print!("{}", render_status_panel(&inputs, colorize));
+
+    println!(
+        "\nDual-agent demo complete: {turns} auditor turn(s); \
+         {published} finding(s) confirmed; {refuted} refuted; \
+         {builds} fresh reviewer runtime(s) built.",
+        turns = outcome.auditor_turns,
+        published = outcome.board.published().count(),
+        refuted = outcome.board.refuted().count(),
+        builds = builds.borrow(),
+    );
+
+    Ok(())
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     // Bare invocation prints the splash banner and exits 0. No credentials
@@ -434,6 +627,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     if args.iter().any(|a| a == "--dry-run") {
         return print_openaudit_dry_run_table();
+    }
+    // Phase-3 audit-demo subcommand: runs an in-process scripted dual-agent
+    // loop and renders the live status panel. No network calls, no playbook
+    // resolution. Showcases the auditor + reviewer state machine end-to-end.
+    if args.first().map(String::as_str) == Some("audit-demo") {
+        return run_audit_demo();
     }
     match parse_args(&args)? {
         CliAction::DumpManifests {
