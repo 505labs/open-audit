@@ -30,6 +30,46 @@
 
 ## 1. CLI entry point and agent loop
 
+**Binary:** `claw` (declared in `rust/crates/rusty-claude-cli/Cargo.toml:8-10`).
+
+**Entry point:** `rust/crates/rusty-claude-cli/src/main.rs:202` — `fn main()` calls `run()`, which parses argv and dispatches to subcommand handlers. The CLI binary is **monolithic — 13,705 LOC** in this single `main.rs` file. Subcommand dispatch goes to handlers like `handle_repl_command` (main.rs:4638), `handle_session_command` (main.rs:5183), and `handle_plugins_command` (main.rs:5314).
+
+**Call chain to the agent loop:**
+
+```
+claw <args>
+└── fn main                                           rusty-claude-cli/src/main.rs:202
+    └── run()                                          dispatches subcommands
+        └── handle_repl_command / print-mode handler   main.rs:4638 (and friends)
+            └── ConversationRuntime::new(...)          wires:
+                  • impl ApiClient for AnthropicRuntimeClient   main.rs:7824
+                      adapter: runtime::ApiClient → api::ProviderClient
+                  • impl ToolExecutor for CliToolExecutor       main.rs:9048
+                      adapter: runtime::ToolExecutor → tools::execute_tool
+                  • Session, PermissionPolicy, system_prompt, hooks
+            └── ConversationRuntime::run_turn          runtime/src/conversation.rs:314
+                └── loop { ... }                       runtime/src/conversation.rs:342
+                      iterations++;
+                      let request = ApiRequest { system_prompt, messages };
+                      let events = api_client.stream(request)?;
+                      for event in events {
+                          AssistantEvent::ToolUse { id, name, input }
+                            → tool_executor.execute(name, input)
+                          AssistantEvent::TextDelta(_) → render
+                          AssistantEvent::Usage(_)     → UsageTracker
+                          AssistantEvent::MessageStop  → exit inner loop
+                      }
+                      if no tool calls remain → break;
+```
+
+**Key contracts (already in place — important for Phase 1 / Phase 3):**
+
+- `runtime::ApiClient` trait (`runtime/src/conversation.rs:53-55`) is **minimal** and synchronous in shape — `fn stream(&mut self, ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError>`. Returns a fully-collected event vector per call (it is not a streaming iterator at this layer; streaming happens *inside* the api crate, then is materialized here).
+- `runtime::ToolExecutor` trait (`runtime/src/conversation.rs:58-60`) — `fn execute(&mut self, tool_name: &str, input: &str) -> Result<String, ToolError>`. Stringly-typed input/output by design; tools use JSON-in / text-or-JSON-out.
+- `runtime::AssistantEvent` enum (`runtime/src/conversation.rs:30-40`) is the canonical event type the agent loop consumes. Variants: `TextDelta(String)`, `ToolUse { id, name, input }`, `Usage(TokenUsage)`, `PromptCache(PromptCacheEvent)`, `MessageStop`. **The Phase-1 Provider abstraction must preserve this event shape** — the api crate's lower-level `StreamEvent` is mapped into `AssistantEvent` by the CLI's `AnthropicRuntimeClient` adapter at main.rs:7824.
+
+**Implication for OpenAudit:** the agent loop already exists, is tested, and has clean trait seams (`ApiClient`, `ToolExecutor`). Phase 3's dual-agent design can be implemented as **two `ConversationRuntime` instances with different system prompts and (typically) different `ApiClient` impls bound to different providers** — no new agent loop needs to be written. Phase 4's evidence store hooks the same trait boundaries: a wrapping `EvidenceLoggingApiClient` and `EvidenceLoggingToolExecutor` are sufficient to capture every turn and tool call.
+
 ## 2. Tool registry
 
 ## 3. Model provider abstraction
