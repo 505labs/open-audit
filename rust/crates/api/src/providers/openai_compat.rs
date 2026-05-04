@@ -19,6 +19,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_DASHSCOPE_BASE_URL: &str = "https://dashscope.aliyuncs.com/compatible-mode/v1";
+pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_secs(1);
@@ -41,11 +42,15 @@ pub struct OpenAiCompatConfig {
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
 const DASHSCOPE_ENV_VARS: &[&str] = &["DASHSCOPE_API_KEY"];
+const MOONSHOT_ENV_VARS: &[&str] = &["MOONSHOT_API_KEY"];
 
 // Provider-specific request body size limits in bytes
 const XAI_MAX_REQUEST_BODY_BYTES: usize = 52_428_800; // 50MB
 const OPENAI_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 const DASHSCOPE_MAX_REQUEST_BODY_BYTES: usize = 6_291_456; // 6MB (observed limit in dogfood)
+// Moonshot direct API. No published limit at the time of writing; mirror OpenAI's
+// 100MB ceiling. Tighten after observing 413s in production.
+const MOONSHOT_MAX_REQUEST_BODY_BYTES: usize = 104_857_600; // 100MB
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -85,12 +90,27 @@ impl OpenAiCompatConfig {
         }
     }
 
+    /// Direct Moonshot AI endpoint (Kimi family models).
+    /// OpenAI-compatible REST shape at api.moonshot.ai/v1. Used by OpenAudit
+    /// as the default auditor backend.
+    #[must_use]
+    pub const fn moonshot() -> Self {
+        Self {
+            provider_name: "Moonshot",
+            api_key_env: "MOONSHOT_API_KEY",
+            base_url_env: "MOONSHOT_BASE_URL",
+            default_base_url: DEFAULT_MOONSHOT_BASE_URL,
+            max_request_body_bytes: MOONSHOT_MAX_REQUEST_BODY_BYTES,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
             "DashScope" => DASHSCOPE_ENV_VARS,
+            "Moonshot" => MOONSHOT_ENV_VARS,
             _ => &[],
         }
     }
@@ -1423,6 +1443,25 @@ mod tests {
     };
     use serde_json::json;
     use std::sync::{Mutex, OnceLock};
+
+    #[test]
+    fn moonshot_config_uses_direct_moonshot_endpoint() {
+        let config = OpenAiCompatConfig::moonshot();
+        assert_eq!(config.provider_name, "Moonshot");
+        assert_eq!(config.api_key_env, "MOONSHOT_API_KEY");
+        assert_eq!(config.base_url_env, "MOONSHOT_BASE_URL");
+        assert_eq!(config.default_base_url, "https://api.moonshot.ai/v1");
+        assert_eq!(config.credential_env_vars(), &["MOONSHOT_API_KEY"]);
+    }
+
+    #[test]
+    fn moonshot_config_is_distinct_from_dashscope() {
+        let moonshot = OpenAiCompatConfig::moonshot();
+        let dashscope = OpenAiCompatConfig::dashscope();
+        assert_ne!(moonshot.default_base_url, dashscope.default_base_url);
+        assert_ne!(moonshot.api_key_env, dashscope.api_key_env);
+        assert_ne!(moonshot.provider_name, dashscope.provider_name);
+    }
 
     #[test]
     fn request_translation_uses_openai_compatible_shape() {
