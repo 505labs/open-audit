@@ -126,6 +126,48 @@ This is exactly the classification axis OpenAudit needs. **For audit mode, only 
 
 ## 3. Model provider abstraction
 
+**A provider abstraction already exists.** The shape differs from the spec's "Provider trait" — it is an `enum`-based dispatcher rather than a `trait`, but functionally it covers the same surface. **Phase 1 should extend, not replace, this design.**
+
+**Key types (all in `rust/crates/api/src/`):**
+
+- `ProviderClient` enum at `client.rs:8-14` with three variants:
+  - `Anthropic(AnthropicClient)`
+  - `Xai(OpenAiCompatClient)`
+  - `OpenAi(OpenAiCompatClient)` — covers OpenAI proper, Alibaba DashScope (qwen, hosted Kimi), and any OpenAI-compatible endpoint (Ollama, vLLM, LM Studio).
+- `ProviderClient::from_model(model: &str)` at `client.rs:17` — single entry point; runs `resolve_model_alias` → `detect_provider_kind` → wires the right backend with the right auth env.
+- `ProviderClient::send_message` (`client.rs:82`) and `ProviderClient::stream_message` (`client.rs:92`) are the two operations. Streaming returns a `MessageStream` enum (`client.rs:110`) that wraps each provider's native stream type.
+- `StreamEvent` enum at `api/src/types.rs:31-35` is the canonical event shape at the api-crate boundary (`MessageStartEvent`, `ContentBlockStartEvent`, `ContentBlockDeltaEvent`, `ContentBlockStopEvent`, `MessageDeltaEvent`, `MessageStopEvent`).
+- The CLI's `AnthropicRuntimeClient` (`rusty-claude-cli/src/main.rs:7824`) is the adapter that converts `StreamEvent` → `runtime::AssistantEvent`. (Despite the name, this adapter dispatches on `ProviderClient`, not just Anthropic — name is legacy.)
+
+**OpenAI-compat configurations** (`api/src/providers/openai_compat.rs:19-21,52-78`):
+- `DEFAULT_XAI_BASE_URL = "https://api.x.ai/v1"`, factory `OpenAiCompatConfig::xai()`.
+- `DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"`, factory `OpenAiCompatConfig::openai()`.
+- `DEFAULT_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"`, factory `OpenAiCompatConfig::dashscope()`.
+
+**Existing Kimi support — but via DashScope, not direct Moonshot.** `providers/mod.rs:126-133` already routes the alias `kimi` to `ProviderKind::OpenAi` with `DASHSCOPE_API_KEY` and the DashScope base URL. `providers/mod.rs:294-298` registers `kimi-k2.5` and `kimi-k1.5` token limits (`max_output_tokens: 16_384`, `context_window_tokens: 256_000`). `kimi` alias resolves to `kimi-k2.5` at `providers/mod.rs:157`.
+
+**Gap vs OpenAudit's Moonshot direct path:**
+
+The user's stated MVP target is **direct Moonshot API at `https://api.moonshot.ai/v1` with model `kimi-2.6`**, not Alibaba's DashScope hosted-Kimi proxy. These are different endpoints with different auth env vars:
+
+| | DashScope hosted Kimi (current) | Moonshot direct (target) |
+|---|---|---|
+| Base URL | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `https://api.moonshot.ai/v1` |
+| Auth env | `DASHSCOPE_API_KEY` | `MOONSHOT_API_KEY` |
+| Wire format | OpenAI-compatible | OpenAI-compatible |
+| Available models | `kimi-k1.5`, `kimi-k2.5` (proxied) | full Moonshot model set including `kimi-2.6` |
+
+**Phase 1 work (much smaller than spec assumed):**
+
+1. Add `pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";` to `api/src/providers/openai_compat.rs`.
+2. Add `OpenAiCompatConfig::moonshot()` factory next to `dashscope()` — auth env `MOONSHOT_API_KEY`, base url env `MOONSHOT_BASE_URL`, default base url constant above.
+3. Add a Moonshot entry to `MODEL_REGISTRY` (`providers/mod.rs:52`) keyed on the alias `kimi` (override the current DashScope route — per OpenAudit defaults, direct Moonshot is preferred). Provide a separate `kimi-dashscope` alias if we want to keep the legacy proxy path.
+4. Add `kimi-2.6` to `model_token_limit` (`providers/mod.rs:294`) with token limits per Moonshot's published spec (verify via `https://platform.moonshot.ai/docs` at implementation time — current code estimates kimi-k2.5 at 256k context / 16k output; kimi-2.6 may differ).
+5. Extend `ProviderClient::from_model` to dispatch to the Moonshot config when the model resolves to a kimi-* canonical name and `MOONSHOT_API_KEY` is set; otherwise fall through to DashScope as today.
+6. Add `~/.openaudit/config.toml` loader (new code) that maps roles → provider+model. Plumbed at the CLI layer; the api crate doesn't need to know about roles.
+
+**No new Provider trait is required** to ship Phase 1. The existing enum is the abstraction. The audit-mode requirement that "tool-call format normalization happens HERE, not in the agent loop" (per spec) is **already satisfied** — the `AnthropicRuntimeClient` adapter at `rusty-claude-cli/src/main.rs:7824` performs the StreamEvent→AssistantEvent translation, and the runtime's `ApiClient` trait sees only the canonical `AssistantEvent` shape.
+
 ## 4. Conversation / turn state
 
 ## 5. System prompt assembly
