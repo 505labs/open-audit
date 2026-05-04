@@ -289,3 +289,60 @@ The asserted string `"second line stderr_preview=stderr warning"` is split acros
 **Implication for Phase 1 acceptance:** "all tests still pass" reads as "the 512-passed/1-failed baseline holds; no new failures introduced." The pre-existing hooks test failure should be tracked as a separate cleanup task (out of OpenAudit MVP scope — file as upstream debt).
 
 ## 7. Risks and unknowns
+
+### Risks
+
+- **R1 — Monolithic CLI main.rs.** `rust/crates/rusty-claude-cli/src/main.rs` is 13,705 LOC in one file. The Phase 1 binary rename and config-dir change touch it; any larger refactor risks merge conflicts with parallel work. **Mitigation:** keep Phase 1 changes surgical — extend, don't restructure. Defer `main.rs` decomposition to a post-MVP cleanup PR.
+
+- **R2 — `ProviderClient` is an enum, not a trait.** Adding new providers requires editing the enum. The spec described a "Provider abstraction" interface; the existing implementation is functionally equivalent but not extensible by external crates. **Decision:** accept as-is for MVP (per Section 3) — adding Moonshot direct config is a small extension. Re-evaluate the trait-vs-enum question after Phase 5 if playbook-supplied providers become a requirement.
+
+- **R3 — `ApiClient::stream` is synchronous-shaped.** `runtime/src/conversation.rs:53-55` returns `Vec<AssistantEvent>` per call rather than a streaming iterator. Live TUI updates (Phase 7) need per-`TextDelta` rendering; the lower-level api crate streams via `MessageStream::next_event`, but the materialization happens inside the CLI adapter at `main.rs:7824` before the runtime sees them. **Mitigation:** Phase 7 will need to either lift the streaming boundary up (a runtime-level `ApiClient::stream_events(...) -> impl Iterator<Item = AssistantEvent>`) or render directly from the api-crate's `MessageStream` in the TUI render path. **Decision deferred** to Phase 7.
+
+- **R4 — Config-dir collision.** `~/.claw/`, `~/.claw.json`, and `<cwd>/.claw/` all exist as live paths. The `~/.openaudit/config.toml` rename collides with none of these (the names are different). However `<cwd>/.claw/sessions/` is the JSONL session store; we need a migration that copies `<cwd>/.claw/` → `<cwd>/.openaudit/` on first run after upgrade. **Risk:** if a user runs both `claw` and `openaudit` in the same workspace they will fork session state. **Mitigation:** during the alias period (one release) we will continue reading `<cwd>/.claw/` as a fallback, but write to `<cwd>/.openaudit/`.
+
+- **R5 — Pre-existing hook test failure on main.** `runtime::hooks::tests::malformed_nonempty_hook_output...` is red on main as of `568f17a`. **Mitigation:** baseline-1 floor; do not regress further. File as a separate ticket in the upstream backlog.
+
+- **R6 — Sandbox is Linux-`unshare`-only.** `runtime/src/sandbox.rs` uses `unshare`, which exists on Linux but not macOS or Windows. Phase 2's `sandbox_exec` will fail on Mac dev machines unless we add a Docker-based path. **Decision:** ship Phase 2 with two backends — `unshare` (existing) and `docker run --network none --read-only` (new). Detect at runtime, prefer `unshare` on Linux, fall back to docker. The two-key rule still applies.
+
+- **R7 — `claude-code` aliases.** The current binary is `claw` (not `claude` or `claude-code`). The spec says "Keep the old name as an alias for one release"; the literal old name is `claw`. **Decision:** Phase 1 renames `claw` → `openaudit`; provides a `claw` alias that emits a stderr deprecation warning. No `claude` alias — that name is upstream and not a name this fork shipped.
+
+- **R8 — DASHSCOPE-routed Kimi vs Moonshot direct.** Existing tests in `provider_client_integration.rs` validate the DashScope-routed Kimi path. Switching the default `kimi` alias to point at Moonshot direct (api.moonshot.ai) will break those tests if they assert the DashScope base URL. **Mitigation:** keep `kimi-dashscope` as an explicit alias for the legacy path; introduce `kimi-2.6`, `kimi-2.5`, etc. as Moonshot-direct aliases; update existing tests to bind on the explicit alias they care about.
+
+- **R9 — Prompt-injection regression test demands a fixture corpus.** Guardrail G1 mandates a planted-vuln + injection-attempt fixture. We have no `fixtures/` tree at all. **Mitigation:** Phase 3 adds `fixtures/prompt-injection/` as a small, in-tree fixture (one Solidity contract or Python file with a real bug, plus a `README.md` containing the injection attempt) that tests can drive against without external network.
+
+- **R10 — Telemetry crate is opt-in but already wires `JsonlTelemetrySink`.** Guardrail G5 says "no telemetry by default." `telemetry` crate exists and is invoked from `ConversationRuntime::with_session_tracer(...)`. **Mitigation:** verify (Phase 1) that `JsonlTelemetrySink` writes only to local disk (no HTTP egress) and that the default `MemoryTelemetrySink` is used unless explicitly opted in. The crate name is fine; the behavior must match the guardrail.
+
+### Unknowns to resolve before Phase 1 starts
+
+- **U1 — Moonshot API key env var name.** Phase 1 will pick `MOONSHOT_API_KEY`. Verify this aligns with Moonshot's official docs at implementation time; if Moonshot uses a different convention, prefer their canonical name.
+
+- **U2 — `kimi-2.6` token limits.** `model_token_limit` (`providers/mod.rs:294`) hardcodes per-model `(max_output_tokens, context_window_tokens)`. Lookup `kimi-2.6` from Moonshot's published spec at implementation time and add the entry.
+
+- **U3 — Reviewer-context isolation primitives.** Spec requires the reviewer agent to "instantiate fresh per finding." `ConversationRuntime` has `fork_session` (`runtime/src/lib.rs:546`); we need to confirm whether forking creates the level of isolation the reviewer needs (independent message history, independent UsageTracker, independent system prompt) or if a fully fresh `ConversationRuntime::new` per review is required. **Decision deferred to Phase 3 design.**
+
+### Phase 1 prerequisites (must be true before drafting Phase 1 sub-plan)
+
+- [x] Surface ownership decision recorded (Section 0). **Rust is canonical.**
+- [x] CLI entry point and agent loop documented (Section 1).
+- [x] Tool registry enumerated (Section 2).
+- [x] Provider abstraction shape documented (Section 3).
+- [x] Persistence layer documented (Section 4).
+- [x] System prompt assembly documented (Section 5).
+- [x] Test harness baseline recorded (Section 6).
+- [x] Risk log written (this section).
+- [ ] Phase 1 sub-plan drafted as a separate document at `docs/superpowers/plans/2026-05-DD-phase-1-rebrand-and-providers.md`. **This is the next concrete step after this PR merges.**
+
+### Phase 1 task shape (preview only — full plan goes in the sub-plan)
+
+1. Add Moonshot direct config (`OpenAiCompatConfig::moonshot()`, `DEFAULT_MOONSHOT_BASE_URL`, `MOONSHOT_API_KEY`).
+2. Add `kimi-2.6` entry to `MODEL_REGISTRY` and `model_token_limit`.
+3. Update `kimi` alias resolution: prefer Moonshot-direct when `MOONSHOT_API_KEY` is set; fall back to `kimi-dashscope` alias for the legacy path.
+4. Rename `[[bin]] name = "claw"` → `"openaudit"` in `rusty-claude-cli/Cargo.toml`. Add `claw` alias shim with deprecation stderr.
+5. Move config dir literal `.claw` → `.openaudit` in `runtime/src/session_control.rs:40` (and any other literal sites — do a search). Add a one-shot migration that copies `<cwd>/.claw/` → `<cwd>/.openaudit/` if the new dir doesn't exist and the old one does.
+6. Add `~/.openaudit/config.toml` loader: `[providers.*]` blocks + `[roles]` block with `auditor`, `reviewer`, `planner` keys.
+7. Add `--dry-run` flag that resolves `[roles] → providers → models` and prints the table.
+8. Add `--provider <name>` and `--role-provider auditor=local` CLI overrides.
+9. Update help text, error messages, and `README.md`/`USAGE.md` user-facing strings: `claw` → `openaudit`.
+10. Tests: add Moonshot integration test using `mock-anthropic-service` extended with an OpenAI-compat fixture.
+11. CHANGELOG entry per the working agreement.
+
